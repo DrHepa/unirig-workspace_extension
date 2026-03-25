@@ -5,7 +5,6 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -20,11 +19,12 @@ from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 
 OFFICIAL_UNIRIG_ARCHIVE_URL = 'https://api.github.com/repos/VAST-AI-Research/UniRig/tarball/HEAD'
-BOOTSTRAP_VERSION = 1
+BOOTSTRAP_VERSION = 2
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
 DEFAULT_SPCONV_PACKAGE = 'spconv-cu120'
 DEFAULT_PYG_PACKAGES = ('torch-scatter', 'torch-cluster')
 DEFAULT_MIN_VRAM_GB = 8.0
+INSTALL_STATES = {'not_installed', 'installing', 'ready', 'error'}
 
 DIRECT_INPUT_SUFFIXES = {'.obj', '.fbx', '.glb', '.vrm'}
 CONVERTIBLE_INPUT_SUFFIXES = {'.gltf', '.stl', '.ply'}
@@ -67,6 +67,112 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         self._runtime_ctx = None
         super().unload()
 
+    def runtime_status(self) -> dict:
+        runtime = _resolve_runtime_context()
+        state = _load_bootstrap_state(runtime)
+        if not state:
+            state = _default_bootstrap_state(runtime)
+        state = _normalize_state(state, runtime)
+
+        if state.get('install_state') == 'ready' and not _runtime_ready(runtime):
+            state['install_state'] = 'error'
+            state['last_error'] = 'Runtime state says ready, but runtime files are missing or invalid.'
+        return state
+
+    def install_runtime(self, progress_cb: Optional[Callable[[int, str], None]] = None) -> dict:
+        runtime = _resolve_runtime_context()
+        force_bootstrap = _env_truthy('MODLY_UNIRIG_FORCE_BOOTSTRAP', False)
+        current = _normalize_state(_load_bootstrap_state(runtime) or _default_bootstrap_state(runtime), runtime)
+        if current['install_state'] == 'ready' and _runtime_ready(runtime) and not force_bootstrap:
+            self._runtime_ctx = runtime
+            return current
+
+        runtime.runtime_root.mkdir(parents=True, exist_ok=True)
+        runtime.logs_dir.mkdir(parents=True, exist_ok=True)
+        bootstrap_log = runtime.logs_dir / f'bootstrap_{int(time.time())}.log'
+
+        if force_bootstrap:
+            if runtime.venv_dir.exists():
+                shutil.rmtree(runtime.venv_dir, ignore_errors=True)
+            if runtime.repo_dir.exists() and not runtime.external_repo:
+                shutil.rmtree(runtime.repo_dir, ignore_errors=True)
+
+        state = _default_bootstrap_state(runtime)
+        state.update(
+            {
+                'install_state': 'installing',
+                'started_at': int(time.time()),
+                'step': 'init',
+                'percent': 0,
+                'bootstrap_log': str(bootstrap_log),
+            }
+        )
+        _write_bootstrap_state(runtime, state)
+
+        try:
+            self._report(progress_cb, 5, 'Preparing runtime directories…')
+            _set_state(runtime, state, step='resolve_python', percent=10)
+            python_cmd = _resolve_python311_command()
+
+            _set_state(runtime, state, step='prepare_repo', percent=20)
+            self._prepare_repo(runtime)
+
+            _set_state(runtime, state, step='create_venv', percent=35)
+            _create_venv(runtime, python_cmd)
+
+            _set_state(runtime, state, step='bootstrap_deps', percent=60)
+            _bootstrap_runtime(runtime, bootstrap_log)
+
+            _set_state(runtime, state, step='validate', percent=85)
+            validation = _validate_runtime(runtime)
+
+            _set_state(
+                runtime,
+                state,
+                install_state='ready',
+                step='done',
+                percent=100,
+                completed_at=int(time.time()),
+                last_error='',
+                python_exe=str(runtime.python_exe),
+            )
+            state['validation'] = validation
+            _write_bootstrap_state(runtime, state)
+            self._runtime_ctx = runtime
+            self._report(progress_cb, 100, 'Runtime ready')
+            return state
+        except Exception as exc:
+            _set_state(
+                runtime,
+                state,
+                install_state='error',
+                step='failed',
+                completed_at=int(time.time()),
+                last_error=str(exc),
+            )
+            raise WorkspaceToolError(f'Failed to install UniRig runtime: {exc}') from exc
+
+    def uninstall_runtime(self) -> None:
+        runtime = _resolve_runtime_context()
+        self._runtime_ctx = None
+        if runtime.venv_dir.exists():
+            shutil.rmtree(runtime.venv_dir, ignore_errors=True)
+        if runtime.repo_dir.exists() and not runtime.external_repo:
+            shutil.rmtree(runtime.repo_dir, ignore_errors=True)
+        state = _default_bootstrap_state(runtime)
+        _write_bootstrap_state(runtime, state)
+
+    def validate_runtime(self) -> dict:
+        runtime = _resolve_runtime_context()
+        status = self.runtime_status()
+        if status.get('install_state') != 'ready':
+            return {'ok': False, 'reason': f"install_state={status.get('install_state')}"}
+        try:
+            payload = _validate_runtime(runtime)
+            return {'ok': True, 'details': payload}
+        except Exception as exc:
+            return {'ok': False, 'reason': str(exc)}
+
     def process(
         self,
         input_path: Path,
@@ -80,8 +186,17 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 f'Unsupported mesh format: {suffix}. Supported: {sorted(SUPPORTED_SUFFIXES)}'
             )
 
+        status = self.runtime_status()
+        if status.get('install_state') != 'ready':
+            raise WorkspaceToolError(
+                'UniRig runtime is not ready. Install it first from the Runtime panel. '
+                f"Current state: {status.get('install_state')} ({status.get('last_error') or 'no details'})"
+            )
+
         seed = _safe_int(params.get('seed'), 12345)
-        runtime = self._ensure_runtime(progress_cb)
+        runtime = self._runtime_ctx or _resolve_runtime_context()
+        if not _runtime_ready(runtime):
+            raise WorkspaceToolError('UniRig runtime files are missing. Reinstall runtime from the Runtime panel.')
 
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = int(time.time())
@@ -165,41 +280,12 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         self._report(progress_cb, 100, 'Rig ready')
         return output_path
 
-    def _ensure_runtime(self, progress_cb: Optional[Callable[[int, str], None]] = None) -> RuntimeContext:
-        if self._runtime_ctx and _runtime_ready(self._runtime_ctx):
-            return self._runtime_ctx
-
-        runtime = _resolve_runtime_context()
-        runtime.runtime_root.mkdir(parents=True, exist_ok=True)
-        runtime.logs_dir.mkdir(parents=True, exist_ok=True)
-
-        if _env_truthy('MODLY_UNIRIG_FORCE_BOOTSTRAP', False):
-            if runtime.venv_dir.exists():
-                shutil.rmtree(runtime.venv_dir, ignore_errors=True)
-            state_path = _bootstrap_state_path(runtime)
-            if state_path.exists():
-                state_path.unlink()
-
-        self._report(progress_cb, 5, 'Preparing UniRig runtime…')
-        if not runtime.repo_dir.exists() or not (runtime.repo_dir / 'run.py').exists():
-            if runtime.external_repo:
-                raise WorkspaceToolError(f'UniRig repo override is invalid: {runtime.repo_dir}')
-            self._report(progress_cb, 10, 'Downloading UniRig repo…')
-            _download_unirig_repo(runtime)
-
-        if not runtime.python_exe.exists():
-            self._report(progress_cb, 15, 'Creating isolated Python runtime…')
-            _create_venv(runtime)
-
-        state = _load_bootstrap_state(runtime)
-        if state.get('bootstrap_version') != BOOTSTRAP_VERSION:
-            self._report(progress_cb, 20, 'Installing UniRig dependencies…')
-            _bootstrap_runtime(runtime)
-
-        self._report(progress_cb, 30, 'Validating GPU runtime…')
-        _validate_runtime(runtime)
-        self._runtime_ctx = runtime
-        return runtime
+    def _prepare_repo(self, runtime: RuntimeContext) -> None:
+        if runtime.repo_dir.exists() and (runtime.repo_dir / 'run.py').exists():
+            return
+        if runtime.external_repo:
+            raise WorkspaceToolError(f'UniRig repo override is invalid: {runtime.repo_dir}')
+        _download_unirig_repo(runtime)
 
     @staticmethod
     def _report(progress_cb: Optional[Callable[[int, str], None]], pct: int, message: str) -> None:
@@ -310,11 +396,42 @@ def _venv_python(venv_dir: Path) -> Path:
 
 
 def _runtime_ready(runtime: RuntimeContext) -> bool:
-    return runtime.python_exe.exists() and (runtime.repo_dir / 'run.py').exists()
+    state = _load_bootstrap_state(runtime)
+    return (
+        runtime.python_exe.exists()
+        and (runtime.repo_dir / 'run.py').exists()
+        and state.get('install_state') == 'ready'
+    )
 
 
 def _bootstrap_state_path(runtime: RuntimeContext) -> Path:
     return runtime.runtime_root / 'bootstrap_state.json'
+
+
+def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
+    return {
+        'bootstrap_version': BOOTSTRAP_VERSION,
+        'install_state': 'not_installed',
+        'percent': 0,
+        'step': 'idle',
+        'last_error': '',
+        'started_at': None,
+        'completed_at': None,
+        'bootstrap_log': '',
+        'python_exe': str(runtime.python_exe),
+        'repo_dir': str(runtime.repo_dir),
+        'venv_dir': str(runtime.venv_dir),
+        'runtime_root': str(runtime.runtime_root),
+    }
+
+
+def _normalize_state(state: dict, runtime: RuntimeContext) -> dict:
+    normalized = _default_bootstrap_state(runtime)
+    normalized.update(state)
+    if normalized.get('install_state') not in INSTALL_STATES:
+        normalized['install_state'] = 'error'
+        normalized['last_error'] = f"Unknown install_state value: {normalized.get('install_state')}"
+    return normalized
 
 
 def _load_bootstrap_state(runtime: RuntimeContext) -> dict:
@@ -322,13 +439,20 @@ def _load_bootstrap_state(runtime: RuntimeContext) -> dict:
     if not state_path.exists():
         return {}
     try:
-        return json.loads(state_path.read_text(encoding='utf-8'))
+        data = json.loads(state_path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
 def _write_bootstrap_state(runtime: RuntimeContext, data: dict) -> None:
+    runtime.runtime_root.mkdir(parents=True, exist_ok=True)
     _bootstrap_state_path(runtime).write_text(json.dumps(data, indent=2), encoding='utf-8')
+
+
+def _set_state(runtime: RuntimeContext, state: dict, **updates: object) -> None:
+    state.update(updates)
+    _write_bootstrap_state(runtime, state)
 
 
 def _download_unirig_repo(runtime: RuntimeContext) -> None:
@@ -374,12 +498,74 @@ def _download_unirig_repo(runtime: RuntimeContext) -> None:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _create_venv(runtime: RuntimeContext) -> None:
+def _resolve_python311_command() -> list[str]:
+    settings = _read_modly_settings()
+
+    env_python = os.environ.get('MODLY_UNIRIG_PYTHON311_BIN')
+    if env_python:
+        cmd = _split_command(env_python)
+        _assert_python311(cmd, source='MODLY_UNIRIG_PYTHON311_BIN')
+        return cmd
+
+    for key in ('externalPython311Bin', 'python311Bin', 'external_python_311_bin'):
+        candidate = settings.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            cmd = _split_command(candidate)
+            _assert_python311(cmd, source=f'settings.{key}')
+            return cmd
+
+    if os.name == 'nt' and shutil.which('py'):
+        cmd = ['py', '-3.11']
+        if _is_python311(cmd):
+            return cmd
+
+    for candidate in ('python3.11', 'python'):
+        resolved = shutil.which(candidate)
+        if not resolved:
+            continue
+        cmd = [resolved]
+        if _is_python311(cmd):
+            return cmd
+
+    raise WorkspaceToolError(
+        'Python 3.11 not found. Set MODLY_UNIRIG_PYTHON311_BIN or configure Modly setting '
+        'externalPython311Bin to a valid Python 3.11 executable.'
+    )
+
+
+def _split_command(command: str) -> list[str]:
+    parts = shlex.split(command)
+    if not parts:
+        raise WorkspaceToolError('Python 3.11 command is empty.')
+    return parts
+
+
+def _assert_python311(command: list[str], source: str) -> None:
+    if not _is_python311(command):
+        raise WorkspaceToolError(f'{source} does not point to a Python 3.11 executable: {_format_command(command)}')
+
+
+def _is_python311(command: Sequence[str]) -> bool:
+    try:
+        result = subprocess.run(
+            [*command, '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return (result.stdout or '').strip() == '3.11'
+
+
+def _create_venv(runtime: RuntimeContext, python311_command: list[str]) -> None:
     if runtime.venv_dir.exists():
         shutil.rmtree(runtime.venv_dir, ignore_errors=True)
     runtime.venv_dir.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
-        [sys.executable, '-m', 'venv', str(runtime.venv_dir)],
+        [*python311_command, '-m', 'venv', str(runtime.venv_dir)],
         capture_output=True,
         text=True,
     )
@@ -390,20 +576,12 @@ def _create_venv(runtime: RuntimeContext) -> None:
         raise WorkspaceToolError(f'Venv creation succeeded but Python executable was not found: {runtime.python_exe}')
 
 
-def _bootstrap_runtime(runtime: RuntimeContext) -> None:
-    bootstrap_log = runtime.logs_dir / f'bootstrap_{int(time.time())}.log'
+def _bootstrap_runtime(runtime: RuntimeContext, bootstrap_log: Path) -> None:
     _run_logged([str(runtime.python_exe), '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], cwd=runtime.repo_dir, log_path=bootstrap_log)
     _install_torch(runtime, bootstrap_log)
     _install_filtered_requirements(runtime, bootstrap_log)
     _run_logged([str(runtime.python_exe), '-m', 'pip', 'install', 'numpy==1.26.4', 'scipy'], cwd=runtime.repo_dir, log_path=bootstrap_log)
     _install_spconv_and_pyg(runtime, bootstrap_log)
-    _write_bootstrap_state(runtime, {
-        'bootstrap_version': BOOTSTRAP_VERSION,
-        'completed_at': int(time.time()),
-        'repo_dir': str(runtime.repo_dir),
-        'venv_dir': str(runtime.venv_dir),
-        'bootstrap_log': str(bootstrap_log),
-    })
 
 
 def _install_torch(runtime: RuntimeContext, log_path: Path) -> None:
@@ -486,7 +664,7 @@ def _query_torch_build(runtime: RuntimeContext) -> dict:
     return _parse_last_json_line(output, 'Failed to query torch build information')
 
 
-def _validate_runtime(runtime: RuntimeContext) -> None:
+def _validate_runtime(runtime: RuntimeContext) -> dict:
     version_script = (
         'import json, sys; '
         "print(json.dumps({'major': sys.version_info.major, 'minor': sys.version_info.minor, 'micro': sys.version_info.micro}))"
@@ -499,7 +677,7 @@ def _validate_runtime(runtime: RuntimeContext) -> None:
         raise WorkspaceToolError(
             'UniRig expects Python 3.11 inside the isolated runtime. '
             f'Current runtime is {version_info.get("major")}.{version_info.get("minor")}.{version_info.get("micro")}. '
-            'Update the packaged Python or point MODLY_UNIRIG_RUNTIME_DIR / MODLY_UNIRIG_REPO_DIR to a compatible local setup.'
+            'Update the Python 3.11 path via MODLY_UNIRIG_PYTHON311_BIN or Modly externalPython311Bin.'
         )
 
     runtime_info = _query_runtime_info(runtime)
@@ -525,6 +703,7 @@ def _validate_runtime(runtime: RuntimeContext) -> None:
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
         raise WorkspaceToolError(f'UniRig runtime is incomplete. Missing files: {missing}')
+    return {'python': version_info, 'gpu': runtime_info}
 
 
 def _query_runtime_info(runtime: RuntimeContext) -> dict:
@@ -655,4 +834,7 @@ __all__ = [
     'build_unirig_commands',
     '_filtered_requirements_text',
     '_prepare_input_mesh',
+    '_default_bootstrap_state',
+    '_normalize_state',
+    '_resolve_python311_command',
 ]
