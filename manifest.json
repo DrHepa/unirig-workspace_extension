@@ -1,0 +1,29 @@
+{
+  "id": "unirig-workspace-v1",
+  "name": "UniRig Workspace Tool",
+  "description": "Local GPU-powered workspace rigging tool. Bootstraps an isolated UniRig runtime, runs skeleton + skin prediction, and merges the result back into a rigged GLB.",
+  "version": "0.1.0",
+  "author": "OpenAI",
+  "extension_type": "workspace_tool",
+  "workspace_tool_class": "UniRigWorkspaceTool",
+  "tool_kind": "mesh_rigger",
+  "priority": 100,
+  "tags": [
+    "workspace",
+    "rigging",
+    "gpu",
+    "unirig",
+    "local"
+  ],
+  "params_schema": [
+    {
+      "id": "seed",
+      "name": "Seed",
+      "type": "int",
+      "default": 12345,
+      "min": 0,
+      "max": 2147483647,
+      "step": 1
+    }
+  ]
+}
