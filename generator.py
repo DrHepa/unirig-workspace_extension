@@ -602,7 +602,18 @@ def _resolve_python311_command(runtime: RuntimeContext, state: dict | None = Non
                 'phases': phases,
             }
 
-    local_python = _ensure_runtime_python311(runtime, state=state, phases=phases)
+    local_python: Path | None = None
+    try:
+        local_python = _ensure_runtime_python311(runtime, state=state, phases=phases)
+    except Exception as exc:
+        attempts.append(
+            {
+                'source': 'runtime_local_python_provisioning',
+                'command': str(runtime.runtime_root / 'python311'),
+                'ok': False,
+                'reason': f'Provisioning failed: {exc}',
+            }
+        )
     if local_python:
         cmd = [str(local_python)]
         ok, info = try_candidate(cmd, 'runtime_local_python')

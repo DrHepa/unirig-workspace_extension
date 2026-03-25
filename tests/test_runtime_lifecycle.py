@@ -127,6 +127,27 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     payload = generator._resolve_python311_command(runtime)
                 self.assertEqual(payload['selected_python_source'], 'runtime_local_python')
 
+    def test_runtime_provisioning_error_still_falls_back_to_path_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+
+                def fake_probe(command: list[str]) -> dict[str, Any]:
+                    if command[0] == '/usr/local/bin/python3.11':
+                        return {'ok': True, 'version': '3.11.9', 'major': 3, 'minor': 11, 'micro': 9}
+                    return {'ok': False, 'reason': 'missing'}
+
+                with patch('generator._find_modly_bundled_python', return_value=None), \
+                     patch('generator._ensure_runtime_python311', side_effect=RuntimeError('network down')), \
+                     patch('generator.shutil.which', side_effect=lambda x: '/usr/local/bin/python3.11' if x == 'python3.11' else None), \
+                     patch('generator._probe_python_version', side_effect=fake_probe):
+                    payload = generator._resolve_python311_command(runtime)
+
+                self.assertEqual(payload['selected_python_source'], 'PATH_python')
+                provisioning_attempts = [a for a in payload['attempts'] if a['source'] == 'runtime_local_python_provisioning']
+                self.assertEqual(len(provisioning_attempts), 1)
+                self.assertIn('Provisioning failed: network down', provisioning_attempts[0]['reason'])
+
     def test_rejects_python314_with_blender_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp, 'MODLY_UNIRIG_PYTHON311_BIN': '/usr/bin/python'}, clear=False):
