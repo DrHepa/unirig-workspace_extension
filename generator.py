@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -19,7 +22,9 @@ from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 
 OFFICIAL_UNIRIG_ARCHIVE_URL = 'https://api.github.com/repos/VAST-AI-Research/UniRig/tarball/HEAD'
-BOOTSTRAP_VERSION = 2
+BOOTSTRAP_VERSION = 3
+PYTHON_STANDALONE_VERSION = '3.11.9'
+PYTHON_STANDALONE_RELEASE = '20240726'
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
 DEFAULT_SPCONV_PACKAGE = 'spconv-cu120'
 DEFAULT_PYG_PACKAGES = ('torch-scatter', 'torch-cluster')
@@ -112,19 +117,38 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         try:
             self._report(progress_cb, 5, 'Preparing runtime directories…')
             _set_state(runtime, state, step='resolve_python', percent=10)
-            python_cmd = _resolve_python311_command()
+            python_resolution = _resolve_python311_command(runtime, state)
+            python_cmd = python_resolution['command']
+            _set_state(
+                runtime,
+                state,
+                selected_python=python_resolution['selected_python'],
+                selected_python_version=python_resolution['selected_python_version'],
+                selected_python_source=python_resolution['selected_python_source'],
+                standalone_python_root=python_resolution.get('standalone_python_root', ''),
+                python_lookup_attempts=python_resolution['attempts'],
+                install_phases=python_resolution['phases'],
+            )
 
             _set_state(runtime, state, step='prepare_repo', percent=20)
             self._prepare_repo(runtime)
+            _append_install_phase(state, 'prepare_repo', 'ok')
+            _write_bootstrap_state(runtime, state)
 
             _set_state(runtime, state, step='create_venv', percent=35)
             _create_venv(runtime, python_cmd)
+            _append_install_phase(state, 'create_venv', 'ok')
+            _write_bootstrap_state(runtime, state)
 
             _set_state(runtime, state, step='bootstrap_deps', percent=60)
             _bootstrap_runtime(runtime, bootstrap_log)
+            _append_install_phase(state, 'bootstrap_runtime', 'ok')
+            _write_bootstrap_state(runtime, state)
 
             _set_state(runtime, state, step='validate', percent=85)
             validation = _validate_runtime(runtime)
+            _append_install_phase(state, 'validate', 'ok')
+            _write_bootstrap_state(runtime, state)
 
             _set_state(
                 runtime,
@@ -150,6 +174,8 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 completed_at=int(time.time()),
                 last_error=str(exc),
             )
+            _append_install_phase(state, state.get('step', 'failed'), 'error', str(exc))
+            _write_bootstrap_state(runtime, state)
             raise WorkspaceToolError(f'Failed to install UniRig runtime: {exc}') from exc
 
     def uninstall_runtime(self) -> None:
@@ -422,6 +448,12 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'repo_dir': str(runtime.repo_dir),
         'venv_dir': str(runtime.venv_dir),
         'runtime_root': str(runtime.runtime_root),
+        'selected_python': '',
+        'selected_python_version': '',
+        'selected_python_source': '',
+        'python_lookup_attempts': [],
+        'standalone_python_root': '',
+        'install_phases': [],
     }
 
 
@@ -453,6 +485,12 @@ def _write_bootstrap_state(runtime: RuntimeContext, data: dict) -> None:
 def _set_state(runtime: RuntimeContext, state: dict, **updates: object) -> None:
     state.update(updates)
     _write_bootstrap_state(runtime, state)
+
+
+def _append_install_phase(state: dict, phase: str, status: str, detail: str = '') -> None:
+    phases = state.setdefault('install_phases', [])
+    if isinstance(phases, list):
+        phases.append({'phase': phase, 'status': status, 'detail': detail, 'at': int(time.time())})
 
 
 def _download_unirig_repo(runtime: RuntimeContext) -> None:
@@ -498,38 +536,122 @@ def _download_unirig_repo(runtime: RuntimeContext) -> None:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _resolve_python311_command() -> list[str]:
+def _resolve_python311_command(runtime: RuntimeContext, state: dict | None = None) -> dict:
     settings = _read_modly_settings()
+    attempts: list[dict] = []
+    phases: list[dict] = []
+
+    def try_candidate(command: list[str], source: str) -> tuple[bool, dict]:
+        info = _probe_python_version(command)
+        attempt = {'source': source, 'command': _format_command(command), 'ok': False, 'version': info.get('version', '')}
+        if not info['ok']:
+            attempt['reason'] = info['reason']
+            attempts.append(attempt)
+            return False, info
+        if info['major'] == 3 and info['minor'] == 11:
+            attempt['ok'] = True
+            attempts.append(attempt)
+            return True, info
+        attempt['reason'] = (
+            f"Rejected version {info['version']}. UniRig requires standalone Python 3.11. "
+            'Blender Python is not used for this bootstrap.'
+        )
+        attempts.append(attempt)
+        return False, info
 
     env_python = os.environ.get('MODLY_UNIRIG_PYTHON311_BIN')
     if env_python:
         cmd = _split_command(env_python)
-        _assert_python311(cmd, source='MODLY_UNIRIG_PYTHON311_BIN')
-        return cmd
+        ok, info = try_candidate(cmd, 'env_override')
+        if ok:
+            return {
+                'command': cmd,
+                'selected_python': cmd[0],
+                'selected_python_version': info['version'],
+                'selected_python_source': 'env_override',
+                'attempts': attempts,
+                'phases': phases,
+            }
 
     for key in ('externalPython311Bin', 'python311Bin', 'external_python_311_bin'):
         candidate = settings.get(key)
         if isinstance(candidate, str) and candidate.strip():
             cmd = _split_command(candidate)
-            _assert_python311(cmd, source=f'settings.{key}')
-            return cmd
+            ok, info = try_candidate(cmd, 'modly_settings')
+            if ok:
+                return {
+                    'command': cmd,
+                    'selected_python': cmd[0],
+                    'selected_python_version': info['version'],
+                    'selected_python_source': 'modly_settings',
+                    'attempts': attempts,
+                    'phases': phases,
+                }
+
+    bundled = _find_modly_bundled_python()
+    if bundled:
+        cmd = [str(bundled)]
+        ok, info = try_candidate(cmd, 'modly_bundled_python')
+        if ok:
+            return {
+                'command': cmd,
+                'selected_python': str(bundled),
+                'selected_python_version': info['version'],
+                'selected_python_source': 'modly_bundled_python',
+                'attempts': attempts,
+                'phases': phases,
+            }
+
+    local_python = _ensure_runtime_python311(runtime, state=state, phases=phases)
+    if local_python:
+        cmd = [str(local_python)]
+        ok, info = try_candidate(cmd, 'runtime_local_python')
+        if ok:
+            return {
+                'command': cmd,
+                'selected_python': str(local_python),
+                'selected_python_version': info['version'],
+                'selected_python_source': 'runtime_local_python',
+                'attempts': attempts,
+                'standalone_python_root': str(runtime.runtime_root / 'python311'),
+                'phases': phases,
+            }
 
     if os.name == 'nt' and shutil.which('py'):
         cmd = ['py', '-3.11']
-        if _is_python311(cmd):
-            return cmd
+        ok, info = try_candidate(cmd, 'py_launcher')
+        if ok:
+            return {
+                'command': cmd,
+                'selected_python': 'py -3.11',
+                'selected_python_version': info['version'],
+                'selected_python_source': 'py_launcher',
+                'attempts': attempts,
+                'phases': phases,
+            }
 
     for candidate in ('python3.11', 'python'):
         resolved = shutil.which(candidate)
         if not resolved:
             continue
         cmd = [resolved]
-        if _is_python311(cmd):
-            return cmd
+        ok, info = try_candidate(cmd, 'PATH_python')
+        if ok:
+            return {
+                'command': cmd,
+                'selected_python': resolved,
+                'selected_python_version': info['version'],
+                'selected_python_source': 'PATH_python',
+                'attempts': attempts,
+                'phases': phases,
+            }
 
+    rejection_log = '\n'.join(
+        f"- {a['source']}: {a['command']} -> {a.get('reason', 'accepted')}" for a in attempts
+    )
     raise WorkspaceToolError(
-        'Python 3.11 not found. Set MODLY_UNIRIG_PYTHON311_BIN or configure Modly setting '
-        'externalPython311Bin to a valid Python 3.11 executable.'
+        'UniRig requires standalone Python 3.11. Blender Python is not used for this bootstrap.\n'
+        f'Lookup attempts:\n{rejection_log or "- (no candidates found)"}'
     )
 
 
@@ -540,24 +662,159 @@ def _split_command(command: str) -> list[str]:
     return parts
 
 
-def _assert_python311(command: list[str], source: str) -> None:
-    if not _is_python311(command):
-        raise WorkspaceToolError(f'{source} does not point to a Python 3.11 executable: {_format_command(command)}')
-
-
 def _is_python311(command: Sequence[str]) -> bool:
+    info = _probe_python_version(command)
+    return bool(info['ok'] and info['major'] == 3 and info['minor'] == 11)
+
+
+def _probe_python_version(command: Sequence[str]) -> dict:
     try:
         result = subprocess.run(
-            [*command, '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'],
+            [
+                *command,
+                '-c',
+                'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")',
+            ],
             capture_output=True,
             text=True,
             timeout=20,
         )
-    except Exception:
-        return False
+    except Exception as exc:
+        return {'ok': False, 'reason': f'Failed to execute candidate: {exc}'}
     if result.returncode != 0:
-        return False
-    return (result.stdout or '').strip() == '3.11'
+        tail = '\n'.join((result.stderr or result.stdout).splitlines()[-5:])
+        return {'ok': False, 'reason': f'Execution failed (exit {result.returncode}): {tail}'}
+    version = (result.stdout or '').strip()
+    parts = version.split('.')
+    if len(parts) != 3:
+        return {'ok': False, 'reason': f'Unexpected version output: {version!r}', 'version': version}
+    try:
+        major, minor, micro = (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return {'ok': False, 'reason': f'Invalid version output: {version!r}', 'version': version}
+    return {'ok': True, 'version': version, 'major': major, 'minor': minor, 'micro': micro}
+
+
+def _find_modly_bundled_python() -> Path | None:
+    env_roots = [
+        os.environ.get('MODLY_RESOURCES_DIR'),
+        os.environ.get('MODLY_APP_DIR'),
+        os.environ.get('MODLY_BACKEND_DIR'),
+    ]
+    candidate_roots: list[Path] = []
+    for raw in env_roots:
+        if raw:
+            candidate_roots.append(Path(raw).expanduser())
+
+    file_root = Path(__file__).resolve()
+    candidate_roots.extend(
+        [
+            file_root.parent,
+            *file_root.parents[:5],
+            Path(sys.executable).resolve().parent,
+        ]
+    )
+
+    checked: set[str] = set()
+    for root in candidate_roots:
+        for probe in _modly_python_candidates_from_root(root):
+            key = str(probe.resolve()) if probe.exists() else str(probe)
+            if key in checked:
+                continue
+            checked.add(key)
+            if probe.exists() and _is_python311([str(probe)]):
+                return probe
+    return None
+
+
+def _modly_python_candidates_from_root(root: Path) -> list[Path]:
+    resources_candidates = [
+        root / 'resources',
+        root.parent / 'resources',
+    ]
+    out: list[Path] = []
+    for resources in resources_candidates:
+        embed = resources / 'python-embed'
+        if os.name == 'nt':
+            out.append(embed / 'python.exe')
+        else:
+            out.extend([embed / 'bin' / 'python3.11', embed / 'bin' / 'python3'])
+    return out
+
+
+def _ensure_runtime_python311(runtime: RuntimeContext, state: dict | None, phases: list[dict]) -> Path | None:
+    root = runtime.runtime_root / 'python311'
+    existing = _find_python_in_tree(root)
+    if existing and _is_python311([str(existing)]):
+        phases.append({'phase': 'python_standalone', 'status': 'reuse', 'detail': str(existing), 'at': int(time.time())})
+        return existing
+
+    archive_override = os.environ.get('MODLY_UNIRIG_PYTHON_STANDALONE_ARCHIVE')
+    url_override = os.environ.get('MODLY_UNIRIG_PYTHON_STANDALONE_URL')
+    archive_path = Path(archive_override).expanduser() if archive_override else None
+    download_url = url_override or _default_python_standalone_url()
+    if not archive_path and not download_url:
+        return None
+
+    phases.append({'phase': 'python_standalone', 'status': 'start', 'detail': str(root), 'at': int(time.time())})
+    if state is not None:
+        state['standalone_python_root'] = str(root)
+    root.mkdir(parents=True, exist_ok=True)
+    archive_file = root / 'python_standalone_archive'
+    if archive_path:
+        shutil.copy2(archive_path, archive_file)
+    else:
+        _download_file(download_url, archive_file)
+    _extract_archive(archive_file, root)
+    archive_file.unlink(missing_ok=True)
+
+    resolved = _find_python_in_tree(root)
+    if not resolved:
+        phases.append({'phase': 'python_standalone', 'status': 'error', 'detail': 'No python binary found after extraction', 'at': int(time.time())})
+        return None
+    phases.append({'phase': 'python_standalone', 'status': 'ok', 'detail': str(resolved), 'at': int(time.time())})
+    return resolved
+
+
+def _default_python_standalone_url() -> str | None:
+    machine = platform.machine().lower()
+    arch = 'x86_64' if machine in {'x86_64', 'amd64'} else machine
+    base = f'https://github.com/indygreg/python-build-standalone/releases/download/{PYTHON_STANDALONE_RELEASE}/'
+    if os.name == 'nt':
+        return base + f'cpython-{PYTHON_STANDALONE_VERSION}+{PYTHON_STANDALONE_RELEASE}-{arch}-pc-windows-msvc-shared-install_only.tar.gz'
+    if sys.platform == 'darwin':
+        return base + f'cpython-{PYTHON_STANDALONE_VERSION}+{PYTHON_STANDALONE_RELEASE}-{arch}-apple-darwin-install_only.tar.gz'
+    if sys.platform.startswith('linux'):
+        return base + f'cpython-{PYTHON_STANDALONE_VERSION}+{PYTHON_STANDALONE_RELEASE}-{arch}-unknown-linux-gnu-install_only.tar.gz'
+    return None
+
+
+def _find_python_in_tree(root: Path) -> Path | None:
+    if not root.exists():
+        return None
+    if os.name == 'nt':
+        names = {'python.exe'}
+    else:
+        names = {'python3.11', 'python3'}
+    for path in root.rglob('*'):
+        if path.is_file() and path.name in names:
+            return path
+    return None
+
+
+def _download_file(url: str, destination: Path) -> None:
+    request = urllib.request.Request(url, headers={'User-Agent': 'Modly-UniRig-PythonBootstrap'})
+    with urllib.request.urlopen(request) as response, destination.open('wb') as out_file:
+        shutil.copyfileobj(response, out_file)
+
+
+def _extract_archive(archive: Path, destination: Path) -> None:
+    if archive.suffix == '.zip':
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(destination)
+        return
+    with tarfile.open(archive, 'r:*') as tf:
+        tf.extractall(destination)
 
 
 def _create_venv(runtime: RuntimeContext, python311_command: list[str]) -> None:
@@ -577,16 +834,16 @@ def _create_venv(runtime: RuntimeContext, python311_command: list[str]) -> None:
 
 
 def _bootstrap_runtime(runtime: RuntimeContext, bootstrap_log: Path) -> None:
-    _run_logged([str(runtime.python_exe), '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], cwd=runtime.repo_dir, log_path=bootstrap_log)
+    _run_logged(_pip_install_command(runtime, ['--upgrade', 'pip', 'setuptools', 'wheel']), cwd=runtime.repo_dir, log_path=bootstrap_log)
     _install_torch(runtime, bootstrap_log)
     _install_filtered_requirements(runtime, bootstrap_log)
-    _run_logged([str(runtime.python_exe), '-m', 'pip', 'install', 'numpy==1.26.4', 'scipy'], cwd=runtime.repo_dir, log_path=bootstrap_log)
+    _run_logged(_pip_install_command(runtime, ['numpy==1.26.4', 'scipy']), cwd=runtime.repo_dir, log_path=bootstrap_log)
     _install_spconv_and_pyg(runtime, bootstrap_log)
 
 
 def _install_torch(runtime: RuntimeContext, log_path: Path) -> None:
     torch_spec = os.environ.get('MODLY_UNIRIG_TORCH_SPEC', DEFAULT_TORCH_SPEC)
-    cmd = [str(runtime.python_exe), '-m', 'pip', 'install', *shlex.split(torch_spec)]
+    cmd = _pip_install_command(runtime, shlex.split(torch_spec))
     torch_index_url = os.environ.get('MODLY_UNIRIG_TORCH_INDEX_URL')
     if torch_index_url:
         cmd.extend(['--index-url', torch_index_url])
@@ -601,7 +858,7 @@ def _install_filtered_requirements(runtime: RuntimeContext, log_path: Path) -> N
     filtered_text = _filtered_requirements_text(requirements_path.read_text(encoding='utf-8'))
     filtered_path = runtime.runtime_root / 'requirements.filtered.txt'
     filtered_path.write_text(filtered_text, encoding='utf-8')
-    _run_logged([str(runtime.python_exe), '-m', 'pip', 'install', '-r', str(filtered_path)], cwd=runtime.repo_dir, log_path=log_path)
+    _run_logged(_pip_install_command(runtime, ['-r', str(filtered_path)]), cwd=runtime.repo_dir, log_path=log_path)
 
 
 def _filtered_requirements_text(raw_text: str) -> str:
@@ -632,23 +889,22 @@ def _base_requirement_name(requirement_line: str) -> str:
 
 def _install_spconv_and_pyg(runtime: RuntimeContext, log_path: Path) -> None:
     spconv_package = os.environ.get('MODLY_UNIRIG_SPCONV_PACKAGE', DEFAULT_SPCONV_PACKAGE)
-    _run_logged([str(runtime.python_exe), '-m', 'pip', 'install', spconv_package], cwd=runtime.repo_dir, log_path=log_path)
+    _run_logged(_pip_install_command(runtime, [spconv_package]), cwd=runtime.repo_dir, log_path=log_path)
 
     pyg_url = os.environ.get('MODLY_UNIRIG_PYG_WHEEL_URL')
     if not pyg_url:
         torch_build = _query_torch_build(runtime)
         pyg_url = f"https://data.pyg.org/whl/torch-{torch_build['torch']}+{torch_build['cuda']}.html"
-    cmd = [
-        str(runtime.python_exe),
-        '-m',
-        'pip',
-        'install',
-        *DEFAULT_PYG_PACKAGES,
-        '-f',
-        pyg_url,
-        '--no-cache-dir',
-    ]
+    cmd = _pip_install_command(runtime, [*DEFAULT_PYG_PACKAGES, '-f', pyg_url, '--no-cache-dir'])
     _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path)
+
+
+def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
+    cmd = [str(runtime.python_exe), '-m', 'pip', 'install', *args]
+    wheelhouse = os.environ.get('MODLY_UNIRIG_WHEELHOUSE_DIR')
+    if wheelhouse:
+        cmd.extend(['--no-index', '--find-links', wheelhouse])
+    return cmd
 
 
 def _query_torch_build(runtime: RuntimeContext) -> dict:
@@ -675,8 +931,9 @@ def _validate_runtime(runtime: RuntimeContext) -> dict:
     )
     if (version_info.get('major'), version_info.get('minor')) != (3, 11):
         raise WorkspaceToolError(
-            'UniRig expects Python 3.11 inside the isolated runtime. '
+            'UniRig requires standalone Python 3.11 inside the isolated runtime. '
             f'Current runtime is {version_info.get("major")}.{version_info.get("minor")}.{version_info.get("micro")}. '
+            'Blender Python is not used for this bootstrap. '
             'Update the Python 3.11 path via MODLY_UNIRIG_PYTHON311_BIN or Modly externalPython311Bin.'
         )
 
