@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -25,12 +26,13 @@ from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 
 OFFICIAL_UNIRIG_ARCHIVE_URL = 'https://api.github.com/repos/VAST-AI-Research/UniRig/tarball/HEAD'
-BOOTSTRAP_VERSION = 3
+BOOTSTRAP_VERSION = 4
 PYTHON_STANDALONE_VERSION = '3.11.9'
 PYTHON_STANDALONE_RELEASE = '20240726'
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
 DEFAULT_SPCONV_PACKAGE = 'spconv-cu120'
 DEFAULT_PYG_PACKAGES = ('torch-scatter', 'torch-cluster')
+DEFAULT_PYG_OPTIONAL_PACKAGES = ('pyg-lib', 'torch-sparse')
 DEFAULT_MIN_VRAM_GB = 8.0
 INSTALL_STATES = {'not_installed', 'installing', 'ready', 'error'}
 HEARTBEAT_INTERVAL_SEC = 5
@@ -67,6 +69,21 @@ class UniRigStageCommands:
     skeleton: list[str]
     skin: list[str]
     merge: list[str]
+
+
+@dataclass(frozen=True)
+class RuntimeProfile:
+    profile_id: str
+    python_minor: str
+    torch: str
+    torchvision: str
+    torchaudio: str
+    torch_index_url: str
+    pyg_wheel_url: str
+    torch_scatter: str
+    torch_cluster: str
+    spconv_package: str
+    cuda_flavor: str
 
 
 class UniRigWorkspaceTool(BaseWorkspaceTool):
@@ -514,6 +531,103 @@ def _runtime_ready(runtime: RuntimeContext) -> bool:
     )
 
 
+def get_supported_runtime_profiles() -> list[RuntimeProfile]:
+    return [
+        RuntimeProfile(
+            profile_id='win-cu128-stable',
+            python_minor='3.11',
+            torch='2.7.1+cu128',
+            torchvision='0.22.1+cu128',
+            torchaudio='2.7.1+cu128',
+            torch_index_url='https://download.pytorch.org/whl/cu128',
+            pyg_wheel_url='https://data.pyg.org/whl/torch-2.7.1+cu128.html',
+            torch_scatter='2.1.2+pt27cu128',
+            torch_cluster='1.6.3+pt27cu128',
+            spconv_package='spconv-cu120',
+            cuda_flavor='cu128',
+        ),
+        RuntimeProfile(
+            profile_id='win-cu126-stable',
+            python_minor='3.11',
+            torch='2.7.1+cu126',
+            torchvision='0.22.1+cu126',
+            torchaudio='2.7.1+cu126',
+            torch_index_url='https://download.pytorch.org/whl/cu126',
+            pyg_wheel_url='https://data.pyg.org/whl/torch-2.7.1+cu126.html',
+            torch_scatter='2.1.2+pt27cu126',
+            torch_cluster='1.6.3+pt27cu126',
+            spconv_package='spconv-cu120',
+            cuda_flavor='cu126',
+        ),
+    ]
+
+
+def resolve_runtime_profile(runtime: RuntimeContext) -> tuple[RuntimeProfile, dict]:
+    os_name = platform.system().lower()
+    gpu_info = _detect_cuda_environment(runtime)
+    forced_profile_id = os.environ.get('MODLY_UNIRIG_RUNTIME_PROFILE', '').strip()
+    if os_name != 'windows':
+        raise WorkspaceToolError('UniRig runtime profile resolver currently supports CUDA bootstrap on Windows only.')
+    if not forced_profile_id and not gpu_info.get('has_nvidia_gpu'):
+        raise WorkspaceToolError(
+            'UniRig runtime requires a CUDA-enabled GPU profile on Windows. '
+            'CPU torch profile is not used by default for this runtime.'
+        )
+    profiles = get_supported_runtime_profiles()
+    if forced_profile_id:
+        forced_profile = next((p for p in profiles if p.profile_id == forced_profile_id), None)
+        if not forced_profile:
+            raise WorkspaceToolError(f'Unknown runtime profile override: {forced_profile_id}')
+        return forced_profile, {'reason': f'forced profile override: {forced_profile_id}', 'gpu': gpu_info, 'wheel_check': {'ok': True}}
+    reasons: list[str] = []
+    for profile in profiles:
+        availability = _validate_profile_binary_wheels(profile)
+        if availability['ok']:
+            reason = (
+                f"selected {profile.profile_id}: NVIDIA GPU detected"
+                f"{' via nvidia-smi' if gpu_info.get('nvidia_smi_ok') else ''}; binary PyG wheels verified"
+            )
+            return profile, {'reason': reason, 'gpu': gpu_info, 'wheel_check': availability}
+        reasons.append(f"{profile.profile_id} rejected: {availability['reason']}")
+    raise WorkspaceToolError(
+        'No compatible Windows CUDA runtime profile has complete binary wheels for cp311 win_amd64. '
+        f'Checked profiles: {"; ".join(reasons)}'
+    )
+
+
+def _detect_cuda_environment(runtime: RuntimeContext) -> dict:
+    forced = os.environ.get('MODLY_UNIRIG_RUNTIME_PROFILE', '').strip()
+    if forced:
+        return {'has_nvidia_gpu': True, 'nvidia_smi_ok': False, 'forced_profile': forced}
+    try:
+        output = _run_capture(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'], cwd=runtime.runtime_root)
+        line = next((ln.strip() for ln in output.splitlines() if ln.strip()), '')
+        return {'has_nvidia_gpu': bool(line), 'nvidia_smi_ok': bool(line), 'nvidia_smi': line}
+    except Exception as exc:
+        if _env_truthy('MODLY_UNIRIG_ASSUME_NVIDIA_GPU', False):
+            return {'has_nvidia_gpu': True, 'nvidia_smi_ok': False, 'warning': f'nvidia-smi check failed: {exc}'}
+        return {'has_nvidia_gpu': False, 'nvidia_smi_ok': False, 'warning': f'nvidia-smi check failed: {exc}'}
+
+
+def _validate_profile_binary_wheels(profile: RuntimeProfile) -> dict:
+    if os.environ.get('MODLY_UNIRIG_SKIP_WHEEL_PROBE') == '1':
+        return {'ok': True, 'reason': 'probe skipped by override'}
+    try:
+        request = urllib.request.Request(profile.pyg_wheel_url, headers={'User-Agent': 'Modly-UniRig-WheelProbe'})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+    except Exception as exc:
+        return {'ok': False, 'reason': f'failed to fetch PyG wheel index: {exc}'}
+    required_tags = [profile.torch_scatter, profile.torch_cluster]
+    for tag in required_tags:
+        if tag not in html:
+            return {'ok': False, 'reason': f'missing package tag {tag} in wheel index'}
+    win311_pattern = re.compile(r'cp311-cp311-win_amd64', re.IGNORECASE)
+    if not win311_pattern.search(html):
+        return {'ok': False, 'reason': 'missing cp311 win_amd64 wheels in wheel index'}
+    return {'ok': True, 'reason': 'binary wheel matrix present'}
+
+
 def _bootstrap_state_path(runtime: RuntimeContext) -> Path:
     return runtime.runtime_root / 'bootstrap_state.json'
 
@@ -548,6 +662,13 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'selected_python_source': '',
         'python_lookup_attempts': [],
         'standalone_python_root': '',
+        'selected_runtime_profile': '',
+        'selected_torch_version': '',
+        'selected_cuda_flavor': '',
+        'selected_pyg_wheel_url': '',
+        'selected_torch_index_url': '',
+        'binary_only_mode': True,
+        'source_build_allowed': _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False),
         'install_phases': [],
         'completed_phases': [],
     }
@@ -1151,6 +1272,26 @@ def _bootstrap_runtime(
     phase_cb: Optional[Callable[[int, str], None]] = None,
 ) -> None:
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'start', 'resumable phases enabled')
+    profile, profile_meta = resolve_runtime_profile(runtime)
+    state.update(
+        {
+            'selected_runtime_profile': profile.profile_id,
+            'selected_torch_version': profile.torch,
+            'selected_cuda_flavor': profile.cuda_flavor,
+            'selected_pyg_wheel_url': profile.pyg_wheel_url,
+            'selected_torch_index_url': profile.torch_index_url,
+            'binary_only_mode': True,
+            'source_build_allowed': _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False),
+        }
+    )
+    _write_bootstrap_state(runtime, state)
+    _log_bootstrap_event(
+        bootstrap_log,
+        'runtime profile',
+        'ok',
+        f"{profile_meta.get('reason', 'selected')} (explicitly not using torch 2.11.0+cpu default path)",
+    )
+    _repair_incompatible_runtime_stack(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     if not _phase_marked(runtime, 'upgrade_pip'):
         _run_subprocess_with_heartbeat(
             runtime,
@@ -1166,14 +1307,14 @@ def _bootstrap_runtime(
         _complete_phase(state, 'upgrade_pip')
     if phase_cb:
         phase_cb(68, 'installing torch')
-    _install_torch(runtime, state, bootstrap_log, progress_cb=progress_cb)
+    _install_torch(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     if phase_cb:
         phase_cb(76, 'installing core requirements')
     _install_filtered_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
     _validate_core_pipeline_imports(runtime, state, bootstrap_log, progress_cb=progress_cb)
     if phase_cb:
         phase_cb(84, 'installing spconv/PyG')
-    _install_spconv_and_pyg(runtime, state, bootstrap_log, progress_cb=progress_cb)
+    _install_spconv_and_pyg(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'ok')
 
 
@@ -1185,21 +1326,78 @@ def _is_module_importable(runtime: RuntimeContext, module_name: str) -> bool:
         return False
 
 
+def _repair_incompatible_runtime_stack(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    profile: RuntimeProfile,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    if not runtime.python_exe.exists():
+        return
+    try:
+        torch_build = _query_torch_build(runtime)
+    except Exception:
+        torch_build = {}
+    installed_torch = str(torch_build.get('version', ''))
+    expected_torch = profile.torch
+    incompatible = bool(installed_torch and installed_torch != expected_torch)
+    if not incompatible and _phase_marked(runtime, 'spconv_pyg'):
+        return
+    packages = [
+        'torch',
+        'torchvision',
+        'torchaudio',
+        'torch-scatter',
+        'torch-cluster',
+        'torch-sparse',
+        'pyg-lib',
+        'spconv',
+        'spconv-cu120',
+    ]
+    _log_bootstrap_event(
+        log_path,
+        'repair runtime stack',
+        'start',
+        f"partial uninstall due to incompatible stack (installed={installed_torch or 'missing'}, expected={expected_torch})",
+    )
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        _pip_uninstall_command(runtime, ['-y', *packages]),
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='repairing incompatible torch/PyG stack',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing torch'],
+    )
+    _log_bootstrap_event(log_path, 'repair runtime stack', 'ok', 'partial cleanup completed')
+
+
 def _install_torch(
     runtime: RuntimeContext,
     state: dict,
     log_path: Path,
+    profile: RuntimeProfile,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> None:
     if _phase_marked(runtime, 'install_torch') and _is_module_importable(runtime, 'torch'):
         _log_bootstrap_event(log_path, 'installing torch', 'ok', 'skipped: already installed')
         _complete_phase(state, 'install_torch')
         return
-    torch_spec = os.environ.get('MODLY_UNIRIG_TORCH_SPEC', DEFAULT_TORCH_SPEC)
-    cmd = _pip_install_command(runtime, shlex.split(torch_spec))
-    torch_index_url = os.environ.get('MODLY_UNIRIG_TORCH_INDEX_URL')
-    if torch_index_url:
-        cmd.extend(['--index-url', torch_index_url])
+    if profile.profile_id.startswith('win-') and '+cpu' in profile.torch:
+        raise WorkspaceToolError('Windows UniRig profile cannot use CPU-only torch as default.')
+    override_spec = os.environ.get('MODLY_UNIRIG_TORCH_SPEC', '').strip()
+    torch_spec = (
+        shlex.split(override_spec)
+        if override_spec
+        else [
+            f'torch=={profile.torch}',
+            f'torchvision=={profile.torchvision}',
+            f'torchaudio=={profile.torchaudio}',
+        ]
+    )
+    cmd = _pip_install_command(runtime, [*torch_spec, '--index-url', profile.torch_index_url])
     _run_subprocess_with_heartbeat(
         runtime,
         state,
@@ -1301,7 +1499,18 @@ def _base_requirement_name(requirement_line: str) -> str:
 def _split_requirements_groups(raw_text: str) -> dict[str, list[str]]:
     huggingface = {'transformers', 'huggingface-hub', 'tokenizers', 'safetensors', 'accelerate', 'sentencepiece', 'timm'}
     geometry = {'trimesh', 'open3d', 'pymeshlab', 'pygltflib', 'rtree', 'xatlas', 'scikit-image', 'opencv-python', 'opencv-python-headless'}
-    optional = {'pytorch-lightning', 'lightning', 'wandb', 'dash', 'ipywidgets', 'flask', 'open3d', 'bpy'}
+    optional = {
+        'pytorch-lightning',
+        'lightning',
+        'wandb',
+        'dash',
+        'ipywidgets',
+        'flask',
+        'open3d',
+        'bpy',
+        'torch-sparse',
+        'pyg-lib',
+    }
     groups = {
         'core_python_libs': [],
         'huggingface_transformers': [],
@@ -1359,49 +1568,67 @@ def _install_spconv_and_pyg(
     runtime: RuntimeContext,
     state: dict,
     log_path: Path,
+    profile: RuntimeProfile,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> None:
     if _phase_marked(runtime, 'spconv_pyg'):
         _complete_phase(state, 'spconv_pyg')
         _log_bootstrap_event(log_path, 'installing spconv/PyG', 'ok', 'skipped: marker exists')
         return
-    spconv_package = os.environ.get('MODLY_UNIRIG_SPCONV_PACKAGE', DEFAULT_SPCONV_PACKAGE)
+    spconv_package = os.environ.get('MODLY_UNIRIG_SPCONV_PACKAGE', profile.spconv_package)
     _run_subprocess_with_heartbeat(
         runtime,
         state,
         progress_cb,
-        _pip_install_command(runtime, [spconv_package]),
+        _pip_install_command(runtime, [spconv_package, '--only-binary=:all:']),
         cwd=runtime.repo_dir,
         log_path=log_path,
         phase='installing spconv/PyG',
         timeout_sec=PHASE_TIMEOUTS_SEC['installing spconv/PyG'],
     )
 
-    pyg_url = os.environ.get('MODLY_UNIRIG_PYG_WHEEL_URL')
-    if not pyg_url:
-        torch_build = _query_torch_build(runtime)
-        pyg_url = f"https://data.pyg.org/whl/torch-{torch_build['torch']}+{torch_build['cuda']}.html"
-    cmd = _pip_install_command(runtime, [*DEFAULT_PYG_PACKAGES, '-f', pyg_url, '--no-cache-dir'])
-    _run_subprocess_with_heartbeat(
-        runtime,
-        state,
-        progress_cb,
-        cmd,
-        cwd=runtime.repo_dir,
-        log_path=log_path,
-        phase='installing spconv/PyG',
-        timeout_sec=PHASE_TIMEOUTS_SEC['installing spconv/PyG'],
-    )
+    pyg_url = os.environ.get('MODLY_UNIRIG_PYG_WHEEL_URL', profile.pyg_wheel_url)
+    binary_only = not _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False)
+    pyg_packages = [f'torch-scatter=={profile.torch_scatter}', f'torch-cluster=={profile.torch_cluster}']
+    install_args = [*pyg_packages, '-f', pyg_url, '--no-cache-dir']
+    if binary_only:
+        install_args.append('--only-binary=:all:')
+    try:
+        _run_subprocess_with_heartbeat(
+            runtime,
+            state,
+            progress_cb,
+            _pip_install_command(runtime, install_args),
+            cwd=runtime.repo_dir,
+            log_path=log_path,
+            phase='installing spconv/PyG',
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing spconv/PyG'],
+        )
+    except Exception as exc:
+        if binary_only:
+            raise WorkspaceToolError(
+                'Binary PyG wheels were not available for the selected runtime profile. '
+                'Source builds are blocked by default. Set MODLY_UNIRIG_ALLOW_SOURCE_BUILDS=1 for expert mode.'
+            ) from exc
+        raise
     _mark_phase(runtime, 'spconv_pyg')
     _complete_phase(state, 'spconv_pyg')
 
 
 def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
+    return _pip_command(runtime, 'install', args)
+
+
+def _pip_uninstall_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
+    return _pip_command(runtime, 'uninstall', args)
+
+
+def _pip_command(runtime: RuntimeContext, pip_subcommand: str, args: Sequence[str]) -> list[str]:
     cmd = [
         str(runtime.python_exe),
         '-m',
         'pip',
-        'install',
+        pip_subcommand,
         '--disable-pip-version-check',
         '--progress-bar',
         'off',
@@ -1409,7 +1636,7 @@ def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[s
         *args,
     ]
     wheelhouse = os.environ.get('MODLY_UNIRIG_WHEELHOUSE_DIR')
-    if wheelhouse:
+    if wheelhouse and pip_subcommand == 'install':
         cmd.extend(['--no-index', '--find-links', wheelhouse])
     return cmd
 
@@ -1445,6 +1672,7 @@ def _validate_runtime(runtime: RuntimeContext) -> dict:
         )
 
     runtime_info = _query_runtime_info(runtime)
+    import_validation = _query_runtime_import_validation(runtime)
     if _env_truthy('MODLY_UNIRIG_ENFORCE_GPU', True):
         if not runtime_info.get('cuda'):
             raise WorkspaceToolError(
@@ -1467,7 +1695,7 @@ def _validate_runtime(runtime: RuntimeContext) -> dict:
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
         raise WorkspaceToolError(f'UniRig runtime is incomplete. Missing files: {missing}')
-    return {'python': version_info, 'gpu': runtime_info}
+    return {'python': version_info, 'gpu': runtime_info, 'imports': import_validation}
 
 
 def _query_runtime_info(runtime: RuntimeContext) -> dict:
@@ -1484,6 +1712,28 @@ def _query_runtime_info(runtime: RuntimeContext) -> dict:
     )
     output = _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir)
     return _parse_last_json_line(output, 'Failed to query UniRig GPU runtime information')
+
+
+def _query_runtime_import_validation(runtime: RuntimeContext) -> dict:
+    script = (
+        'import importlib, json, torch; '
+        "mods = ['torch', 'torch_scatter', 'torch_cluster', 'spconv']; "
+        "results = {}; "
+        '\nfor mod in mods:\n'
+        '    try:\n'
+        '        importlib.import_module(mod)\n'
+        "        results[mod] = 'ok'\n"
+        '    except Exception as exc:\n'
+        "        results[mod] = f'error: {exc}'\n"
+        "payload = {'results': results, 'torch_version': torch.__version__, 'torch_cuda_version': torch.version.cuda, 'cuda_available': bool(torch.cuda.is_available())}; "
+        'print(json.dumps(payload))'
+    )
+    output = _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir)
+    payload = _parse_last_json_line(output, 'Failed to validate installed torch/PyG imports')
+    failed = {k: v for k, v in payload.get('results', {}).items() if v != 'ok'}
+    if failed:
+        raise WorkspaceToolError(f'UniRig runtime import validation failed: {failed}')
+    return payload
 
 
 def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:

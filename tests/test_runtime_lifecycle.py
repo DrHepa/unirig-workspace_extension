@@ -58,6 +58,85 @@ generator = importlib.import_module('generator')
 
 
 class RuntimeLifecycleTests(unittest.TestCase):
+    def test_runtime_profile_resolver_prefers_win_cu128_on_windows_nvidia(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                with patch('generator.platform.system', return_value='Windows'), patch(
+                    'generator._detect_cuda_environment',
+                    return_value={'has_nvidia_gpu': True, 'nvidia_smi_ok': True},
+                ), patch('generator._validate_profile_binary_wheels', side_effect=[{'ok': True, 'reason': 'ok'}]):
+                    profile, _meta = generator.resolve_runtime_profile(runtime)
+                self.assertEqual(profile.profile_id, 'win-cu128-stable')
+
+    def test_runtime_profile_rejects_cpu_default_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                with patch('generator.platform.system', return_value='Windows'), patch(
+                    'generator._detect_cuda_environment',
+                    return_value={'has_nvidia_gpu': False, 'nvidia_smi_ok': False},
+                ):
+                    with self.assertRaises(_WorkspaceToolError) as ctx:
+                        generator.resolve_runtime_profile(runtime)
+                self.assertIn('CPU torch profile is not used by default', str(ctx.exception))
+
+    def test_spconv_pyg_binary_only_failure_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                with patch('generator._run_subprocess_with_heartbeat', side_effect=[None, _WorkspaceToolError('no wheel')]):
+                    with self.assertRaises(_WorkspaceToolError) as ctx:
+                        generator._install_spconv_and_pyg(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                self.assertIn('Source builds are blocked by default', str(ctx.exception))
+
+    def test_repair_runtime_stack_uninstalls_incompatible_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                called: list[list[str]] = []
+
+                def capture_cmd(*args: Any, **kwargs: Any) -> None:
+                    called.append(list(args[3]))
+
+                with patch('generator._query_torch_build', return_value={'version': '2.11.0+cpu'}), patch(
+                    'generator._run_subprocess_with_heartbeat',
+                    side_effect=capture_cmd,
+                ):
+                    generator._repair_incompatible_runtime_stack(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                self.assertTrue(any('uninstall' in cmd for cmd in called))
+
+    def test_validate_runtime_import_validation_is_included(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                (runtime.repo_dir / 'configs' / 'task').mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / generator.SKELETON_TASK).write_text('', encoding='utf-8')
+                (runtime.repo_dir / generator.SKIN_TASK).write_text('', encoding='utf-8')
+                (runtime.repo_dir / 'src' / 'inference').mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'src' / 'inference' / 'merge.py').write_text('', encoding='utf-8')
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                with patch('generator._run_capture', return_value='{"major":3,"minor":11,"micro":9}\n'), patch(
+                    'generator._query_runtime_info',
+                    return_value={'cuda': True, 'vram_gb': 16.0},
+                ), patch(
+                    'generator._query_runtime_import_validation',
+                    return_value={'results': {'torch': 'ok', 'torch_scatter': 'ok', 'torch_cluster': 'ok', 'spconv': 'ok'}},
+                ):
+                    payload = generator._validate_runtime(runtime)
+                self.assertIn('imports', payload)
+
     def test_set_state_and_report_updates_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
