@@ -113,15 +113,24 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             }
         )
         _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(bootstrap_log, 'install_runtime', 'start', 'bootstrap started')
 
         try:
-            self._report(progress_cb, 5, 'Preparing runtime directories…')
-            _set_state(runtime, state, step='resolve_python', percent=10)
-            python_resolution = _resolve_python311_command(runtime, state)
-            python_cmd = python_resolution['command']
-            _set_state(
+            _set_state_and_report(runtime, state, progress_cb, 5, 'preparing runtime directories')
+            _set_state_and_report(runtime, state, progress_cb, 12, 'finding python 3.11')
+            python_resolution = _resolve_python311_command(
                 runtime,
                 state,
+                phase_cb=lambda percent, step: _set_state_and_report(runtime, state, progress_cb, percent, step),
+                bootstrap_log=bootstrap_log,
+            )
+            python_cmd = python_resolution['command']
+            _set_state_and_report(
+                runtime,
+                state,
+                progress_cb,
+                30,
+                'python 3.11 selected',
                 selected_python=python_resolution['selected_python'],
                 selected_python_version=python_resolution['selected_python_version'],
                 selected_python_source=python_resolution['selected_python_source'],
@@ -130,32 +139,46 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 install_phases=python_resolution['phases'],
             )
 
-            _set_state(runtime, state, step='prepare_repo', percent=20)
-            self._prepare_repo(runtime)
+            _set_state_and_report(runtime, state, progress_cb, 35, 'preparing UniRig repo')
+            downloaded_repo = self._prepare_repo(
+                runtime,
+                bootstrap_log=bootstrap_log,
+                heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb),
+            )
+            if downloaded_repo:
+                _set_state_and_report(runtime, state, progress_cb, 42, 'downloading UniRig repo')
             _append_install_phase(state, 'prepare_repo', 'ok')
             _write_bootstrap_state(runtime, state)
 
-            _set_state(runtime, state, step='create_venv', percent=35)
-            _create_venv(runtime, python_cmd)
+            _set_state_and_report(runtime, state, progress_cb, 55, 'creating venv')
+            _log_bootstrap_event(bootstrap_log, 'creating venv', 'start', _format_command([*python_cmd, '-m', 'venv', str(runtime.venv_dir)]))
+            _create_venv(runtime, python_cmd, heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb))
+            _log_bootstrap_event(bootstrap_log, 'creating venv', 'ok')
             _append_install_phase(state, 'create_venv', 'ok')
             _write_bootstrap_state(runtime, state)
 
-            _set_state(runtime, state, step='bootstrap_deps', percent=60)
-            _bootstrap_runtime(runtime, bootstrap_log)
+            _set_state_and_report(runtime, state, progress_cb, 65, 'installing torch')
+            _bootstrap_runtime(
+                runtime,
+                bootstrap_log,
+                phase_cb=lambda percent, step: _set_state_and_report(runtime, state, progress_cb, percent, step),
+                heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb),
+            )
             _append_install_phase(state, 'bootstrap_runtime', 'ok')
             _write_bootstrap_state(runtime, state)
 
-            _set_state(runtime, state, step='validate', percent=85)
+            _set_state_and_report(runtime, state, progress_cb, 92, 'validating CUDA')
             validation = _validate_runtime(runtime)
             _append_install_phase(state, 'validate', 'ok')
             _write_bootstrap_state(runtime, state)
 
-            _set_state(
+            _set_state_and_report(
                 runtime,
                 state,
+                progress_cb,
+                100,
+                'ready',
                 install_state='ready',
-                step='done',
-                percent=100,
                 completed_at=int(time.time()),
                 last_error='',
                 python_exe=str(runtime.python_exe),
@@ -163,19 +186,22 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             state['validation'] = validation
             _write_bootstrap_state(runtime, state)
             self._runtime_ctx = runtime
-            self._report(progress_cb, 100, 'Runtime ready')
+            _log_bootstrap_event(bootstrap_log, 'install_runtime', 'ok', 'runtime ready')
             return state
         except Exception as exc:
-            _set_state(
+            _set_state_and_report(
                 runtime,
                 state,
+                progress_cb,
+                int(state.get('percent', 0)),
+                'failed',
                 install_state='error',
-                step='failed',
                 completed_at=int(time.time()),
                 last_error=str(exc),
             )
             _append_install_phase(state, state.get('step', 'failed'), 'error', str(exc))
             _write_bootstrap_state(runtime, state)
+            _log_bootstrap_event(bootstrap_log, state.get('step', 'failed'), 'error', str(exc))
             raise WorkspaceToolError(f'Failed to install UniRig runtime: {exc}') from exc
 
     def uninstall_runtime(self) -> None:
@@ -306,12 +332,18 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         self._report(progress_cb, 100, 'Rig ready')
         return output_path
 
-    def _prepare_repo(self, runtime: RuntimeContext) -> None:
+    def _prepare_repo(
+        self,
+        runtime: RuntimeContext,
+        bootstrap_log: Path | None = None,
+        heartbeat_cb: Optional[Callable[[], None]] = None,
+    ) -> bool:
         if runtime.repo_dir.exists() and (runtime.repo_dir / 'run.py').exists():
-            return
+            return False
         if runtime.external_repo:
             raise WorkspaceToolError(f'UniRig repo override is invalid: {runtime.repo_dir}')
-        _download_unirig_repo(runtime)
+        _download_unirig_repo(runtime, bootstrap_log=bootstrap_log, heartbeat_cb=heartbeat_cb)
+        return True
 
     @staticmethod
     def _report(progress_cb: Optional[Callable[[int, str], None]], pct: int, message: str) -> None:
@@ -435,14 +467,18 @@ def _bootstrap_state_path(runtime: RuntimeContext) -> Path:
 
 
 def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
+    now = int(time.time())
     return {
         'bootstrap_version': BOOTSTRAP_VERSION,
         'install_state': 'not_installed',
         'percent': 0,
         'step': 'idle',
+        'message': 'not installed',
         'last_error': '',
         'started_at': None,
         'completed_at': None,
+        'updated_at': now,
+        'last_heartbeat_at': now,
         'bootstrap_log': '',
         'python_exe': str(runtime.python_exe),
         'repo_dir': str(runtime.repo_dir),
@@ -487,13 +523,53 @@ def _set_state(runtime: RuntimeContext, state: dict, **updates: object) -> None:
     _write_bootstrap_state(runtime, state)
 
 
+def _set_state_and_report(
+    runtime: RuntimeContext,
+    state: dict,
+    progress_cb: Optional[Callable[[int, str], None]],
+    percent: int,
+    step: str,
+    **updates: object,
+) -> None:
+    now = int(time.time())
+    message = updates.pop('message', step)
+    state.update(
+        {
+            'percent': percent,
+            'step': step,
+            'message': message,
+            'updated_at': now,
+            'last_heartbeat_at': now,
+            **updates,
+        }
+    )
+    _write_bootstrap_state(runtime, state)
+    if progress_cb:
+        progress_cb(percent, step)
+
+
+def _heartbeat_state(
+    runtime: RuntimeContext,
+    state: dict,
+    progress_cb: Optional[Callable[[int, str], None]],
+) -> None:
+    _set_state_and_report(
+        runtime,
+        state,
+        progress_cb,
+        int(state.get('percent', 0)),
+        str(state.get('step', 'installing')),
+        message=state.get('message') or state.get('step', 'installing'),
+    )
+
+
 def _append_install_phase(state: dict, phase: str, status: str, detail: str = '') -> None:
     phases = state.setdefault('install_phases', [])
     if isinstance(phases, list):
         phases.append({'phase': phase, 'status': status, 'detail': detail, 'at': int(time.time())})
 
 
-def _download_unirig_repo(runtime: RuntimeContext) -> None:
+def _download_unirig_repo(runtime: RuntimeContext, bootstrap_log: Path | None = None, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     archive_url = os.environ.get('MODLY_UNIRIG_REPO_ARCHIVE_URL', OFFICIAL_UNIRIG_ARCHIVE_URL)
     tmp_dir = runtime.runtime_root / '_repo_download'
     if tmp_dir.exists():
@@ -501,16 +577,12 @@ def _download_unirig_repo(runtime: RuntimeContext) -> None:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     archive_path = tmp_dir / 'unirig.tar.gz'
 
-    request = urllib.request.Request(
-        archive_url,
-        headers={
-            'User-Agent': 'Modly-UniRig-WorkspaceTool',
-            'Accept': 'application/vnd.github+json',
-        },
-    )
     try:
-        with urllib.request.urlopen(request) as response, archive_path.open('wb') as out_file:
-            shutil.copyfileobj(response, out_file)
+        if bootstrap_log:
+            _log_bootstrap_event(bootstrap_log, 'downloading UniRig repo', 'start', archive_url)
+        _download_file(archive_url, archive_path, heartbeat_cb=heartbeat_cb)
+        if bootstrap_log:
+            _log_bootstrap_event(bootstrap_log, 'downloading UniRig repo', 'ok')
     except Exception as exc:
         raise WorkspaceToolError(
             'Failed to download the official UniRig repository. '
@@ -521,8 +593,12 @@ def _download_unirig_repo(runtime: RuntimeContext) -> None:
     extract_dir = tmp_dir / 'extract'
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
+        if bootstrap_log:
+            _log_bootstrap_event(bootstrap_log, 'extracting UniRig repo', 'start', str(archive_path))
         with tarfile.open(archive_path, 'r:gz') as tar_file:
             tar_file.extractall(extract_dir)
+        if bootstrap_log:
+            _log_bootstrap_event(bootstrap_log, 'extracting UniRig repo', 'ok')
     except Exception as exc:
         raise WorkspaceToolError(f'Failed to extract UniRig repository archive: {exc}') from exc
 
@@ -536,7 +612,12 @@ def _download_unirig_repo(runtime: RuntimeContext) -> None:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _resolve_python311_command(runtime: RuntimeContext, state: dict | None = None) -> dict:
+def _resolve_python311_command(
+    runtime: RuntimeContext,
+    state: dict | None = None,
+    phase_cb: Optional[Callable[[int, str], None]] = None,
+    bootstrap_log: Path | None = None,
+) -> dict:
     settings = _read_modly_settings()
     attempts: list[dict] = []
     phases: list[dict] = []
@@ -590,6 +671,8 @@ def _resolve_python311_command(runtime: RuntimeContext, state: dict | None = Non
 
     bundled = _find_modly_bundled_python()
     if bundled:
+        if phase_cb:
+            phase_cb(18, 'reusing bundled python')
         cmd = [str(bundled)]
         ok, info = try_candidate(cmd, 'modly_bundled_python')
         if ok:
@@ -602,7 +685,13 @@ def _resolve_python311_command(runtime: RuntimeContext, state: dict | None = Non
                 'phases': phases,
             }
 
-    local_python = _ensure_runtime_python311(runtime, state=state, phases=phases)
+    local_python = _ensure_runtime_python311(
+        runtime,
+        state=state,
+        phases=phases,
+        phase_cb=phase_cb,
+        bootstrap_log=bootstrap_log,
+    )
     if local_python:
         cmd = [str(local_python)]
         ok, info = try_candidate(cmd, 'runtime_local_python')
@@ -742,10 +831,18 @@ def _modly_python_candidates_from_root(root: Path) -> list[Path]:
     return out
 
 
-def _ensure_runtime_python311(runtime: RuntimeContext, state: dict | None, phases: list[dict]) -> Path | None:
+def _ensure_runtime_python311(
+    runtime: RuntimeContext,
+    state: dict | None,
+    phases: list[dict],
+    phase_cb: Optional[Callable[[int, str], None]] = None,
+    bootstrap_log: Path | None = None,
+) -> Path | None:
     root = runtime.runtime_root / 'python311'
     existing = _find_python_in_tree(root)
     if existing and _is_python311([str(existing)]):
+        if phase_cb:
+            phase_cb(22, 'reusing local python 3.11')
         phases.append({'phase': 'python_standalone', 'status': 'reuse', 'detail': str(existing), 'at': int(time.time())})
         return existing
 
@@ -762,10 +859,20 @@ def _ensure_runtime_python311(runtime: RuntimeContext, state: dict | None, phase
     root.mkdir(parents=True, exist_ok=True)
     archive_file = root / 'python_standalone_archive'
     if archive_path:
+        if phase_cb:
+            phase_cb(22, 'downloading local python 3.11')
         shutil.copy2(archive_path, archive_file)
     else:
-        _download_file(download_url, archive_file)
-    _extract_archive(archive_file, root)
+        if phase_cb:
+            phase_cb(22, 'downloading local python 3.11')
+        _download_file(download_url, archive_file, heartbeat_cb=(lambda: phase_cb(22, 'downloading local python 3.11')) if phase_cb else None)
+    if phase_cb:
+        phase_cb(28, 'extracting local python 3.11')
+    _extract_archive(
+        archive_file,
+        root,
+        heartbeat_cb=(lambda: phase_cb(28, 'extracting local python 3.11')) if phase_cb else None,
+    )
     archive_file.unlink(missing_ok=True)
 
     resolved = _find_python_in_tree(root)
@@ -802,22 +909,37 @@ def _find_python_in_tree(root: Path) -> Path | None:
     return None
 
 
-def _download_file(url: str, destination: Path) -> None:
+def _download_file(url: str, destination: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     request = urllib.request.Request(url, headers={'User-Agent': 'Modly-UniRig-PythonBootstrap'})
     with urllib.request.urlopen(request) as response, destination.open('wb') as out_file:
-        shutil.copyfileobj(response, out_file)
+        last_heartbeat = 0.0
+        while True:
+            chunk = response.read(1024 * 256)
+            if not chunk:
+                break
+            out_file.write(chunk)
+            now = time.time()
+            if heartbeat_cb and now - last_heartbeat >= 2.0:
+                heartbeat_cb()
+                last_heartbeat = now
 
 
-def _extract_archive(archive: Path, destination: Path) -> None:
+def _extract_archive(archive: Path, destination: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     if archive.suffix == '.zip':
         with zipfile.ZipFile(archive) as zf:
-            zf.extractall(destination)
+            for member in zf.infolist():
+                zf.extract(member, destination)
+                if heartbeat_cb:
+                    heartbeat_cb()
         return
     with tarfile.open(archive, 'r:*') as tf:
-        tf.extractall(destination)
+        for member in tf.getmembers():
+            tf.extract(member, destination)
+            if heartbeat_cb:
+                heartbeat_cb()
 
 
-def _create_venv(runtime: RuntimeContext, python311_command: list[str]) -> None:
+def _create_venv(runtime: RuntimeContext, python311_command: list[str], heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     if runtime.venv_dir.exists():
         shutil.rmtree(runtime.venv_dir, ignore_errors=True)
     runtime.venv_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -826,6 +948,8 @@ def _create_venv(runtime: RuntimeContext, python311_command: list[str]) -> None:
         capture_output=True,
         text=True,
     )
+    if heartbeat_cb:
+        heartbeat_cb()
     if result.returncode != 0:
         tail = '\n'.join((result.stderr or result.stdout).splitlines()[-40:])
         raise WorkspaceToolError(f'Failed to create the isolated UniRig venv. Last output:\n{tail}')
@@ -833,24 +957,49 @@ def _create_venv(runtime: RuntimeContext, python311_command: list[str]) -> None:
         raise WorkspaceToolError(f'Venv creation succeeded but Python executable was not found: {runtime.python_exe}')
 
 
-def _bootstrap_runtime(runtime: RuntimeContext, bootstrap_log: Path) -> None:
-    _run_logged(_pip_install_command(runtime, ['--upgrade', 'pip', 'setuptools', 'wheel']), cwd=runtime.repo_dir, log_path=bootstrap_log)
-    _install_torch(runtime, bootstrap_log)
-    _install_filtered_requirements(runtime, bootstrap_log)
-    _run_logged(_pip_install_command(runtime, ['numpy==1.26.4', 'scipy']), cwd=runtime.repo_dir, log_path=bootstrap_log)
-    _install_spconv_and_pyg(runtime, bootstrap_log)
+def _bootstrap_runtime(
+    runtime: RuntimeContext,
+    bootstrap_log: Path,
+    phase_cb: Optional[Callable[[int, str], None]] = None,
+    heartbeat_cb: Optional[Callable[[], None]] = None,
+) -> None:
+    _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'start')
+    _run_logged(
+        _pip_install_command(runtime, ['--upgrade', 'pip', 'setuptools', 'wheel']),
+        cwd=runtime.repo_dir,
+        log_path=bootstrap_log,
+        phase='bootstrap deps',
+        heartbeat_cb=heartbeat_cb,
+    )
+    if phase_cb:
+        phase_cb(68, 'installing torch')
+    _install_torch(runtime, bootstrap_log, heartbeat_cb=heartbeat_cb)
+    if phase_cb:
+        phase_cb(76, 'installing UniRig requirements')
+    _install_filtered_requirements(runtime, bootstrap_log, heartbeat_cb=heartbeat_cb)
+    _run_logged(
+        _pip_install_command(runtime, ['numpy==1.26.4', 'scipy']),
+        cwd=runtime.repo_dir,
+        log_path=bootstrap_log,
+        phase='installing UniRig requirements',
+        heartbeat_cb=heartbeat_cb,
+    )
+    if phase_cb:
+        phase_cb(84, 'installing spconv/PyG')
+    _install_spconv_and_pyg(runtime, bootstrap_log, heartbeat_cb=heartbeat_cb)
+    _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'ok')
 
 
-def _install_torch(runtime: RuntimeContext, log_path: Path) -> None:
+def _install_torch(runtime: RuntimeContext, log_path: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     torch_spec = os.environ.get('MODLY_UNIRIG_TORCH_SPEC', DEFAULT_TORCH_SPEC)
     cmd = _pip_install_command(runtime, shlex.split(torch_spec))
     torch_index_url = os.environ.get('MODLY_UNIRIG_TORCH_INDEX_URL')
     if torch_index_url:
         cmd.extend(['--index-url', torch_index_url])
-    _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path)
+    _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path, phase='installing torch', heartbeat_cb=heartbeat_cb)
 
 
-def _install_filtered_requirements(runtime: RuntimeContext, log_path: Path) -> None:
+def _install_filtered_requirements(runtime: RuntimeContext, log_path: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     requirements_path = runtime.repo_dir / 'requirements.txt'
     if not requirements_path.exists():
         raise WorkspaceToolError(f'UniRig requirements.txt not found: {requirements_path}')
@@ -858,7 +1007,13 @@ def _install_filtered_requirements(runtime: RuntimeContext, log_path: Path) -> N
     filtered_text = _filtered_requirements_text(requirements_path.read_text(encoding='utf-8'))
     filtered_path = runtime.runtime_root / 'requirements.filtered.txt'
     filtered_path.write_text(filtered_text, encoding='utf-8')
-    _run_logged(_pip_install_command(runtime, ['-r', str(filtered_path)]), cwd=runtime.repo_dir, log_path=log_path)
+    _run_logged(
+        _pip_install_command(runtime, ['-r', str(filtered_path)]),
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='installing UniRig requirements',
+        heartbeat_cb=heartbeat_cb,
+    )
 
 
 def _filtered_requirements_text(raw_text: str) -> str:
@@ -887,16 +1042,16 @@ def _base_requirement_name(requirement_line: str) -> str:
     return cleaned.replace('_', '-').lower()
 
 
-def _install_spconv_and_pyg(runtime: RuntimeContext, log_path: Path) -> None:
+def _install_spconv_and_pyg(runtime: RuntimeContext, log_path: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
     spconv_package = os.environ.get('MODLY_UNIRIG_SPCONV_PACKAGE', DEFAULT_SPCONV_PACKAGE)
-    _run_logged(_pip_install_command(runtime, [spconv_package]), cwd=runtime.repo_dir, log_path=log_path)
+    _run_logged(_pip_install_command(runtime, [spconv_package]), cwd=runtime.repo_dir, log_path=log_path, phase='installing spconv/PyG', heartbeat_cb=heartbeat_cb)
 
     pyg_url = os.environ.get('MODLY_UNIRIG_PYG_WHEEL_URL')
     if not pyg_url:
         torch_build = _query_torch_build(runtime)
         pyg_url = f"https://data.pyg.org/whl/torch-{torch_build['torch']}+{torch_build['cuda']}.html"
     cmd = _pip_install_command(runtime, [*DEFAULT_PYG_PACKAGES, '-f', pyg_url, '--no-cache-dir'])
-    _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path)
+    _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path, phase='installing spconv/PyG', heartbeat_cb=heartbeat_cb)
 
 
 def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
@@ -1005,9 +1160,17 @@ def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
     return converted_path
 
 
-def _run_logged(command: Sequence[str], cwd: Path, log_path: Path, env: dict | None = None) -> None:
+def _run_logged(
+    command: Sequence[str],
+    cwd: Path,
+    log_path: Path,
+    env: dict | None = None,
+    phase: str = 'command',
+    heartbeat_cb: Optional[Callable[[], None]] = None,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open('a', encoding='utf-8') as log_file:
+        log_file.write(f'[{phase}] start\n')
         log_file.write(f'$ {_format_command(command)}\n')
         log_file.flush()
         result = subprocess.run(
@@ -1018,6 +1181,12 @@ def _run_logged(command: Sequence[str], cwd: Path, log_path: Path, env: dict | N
             text=True,
             env=env,
         )
+        if heartbeat_cb:
+            heartbeat_cb()
+        if result.returncode == 0:
+            log_file.write(f'[{phase}] ok\n')
+        else:
+            log_file.write(f'[{phase}] error (exit={result.returncode})\n')
     if result.returncode != 0:
         tail = _tail_text(log_path, 60)
         raise WorkspaceToolError(
@@ -1083,6 +1252,16 @@ def _safe_float(value: object, default: float) -> float:
         return float(value)  # type: ignore[arg-type]
     except Exception:
         return default
+
+
+def _log_bootstrap_event(log_path: Path, phase: str, status: str, detail: str = '') -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
+    line = f'[{timestamp}] [{phase}] {status}'
+    if detail:
+        line += f' :: {detail}'
+    with log_path.open('a', encoding='utf-8') as handle:
+        handle.write(line + '\n')
 
 
 __all__ = [

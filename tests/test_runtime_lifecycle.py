@@ -58,6 +58,26 @@ generator = importlib.import_module('generator')
 
 
 class RuntimeLifecycleTests(unittest.TestCase):
+    def test_set_state_and_report_updates_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                state = generator._default_bootstrap_state(runtime)
+                seen: list[tuple[int, str]] = []
+                generator._set_state_and_report(
+                    runtime,
+                    state,
+                    lambda pct, step: seen.append((pct, step)),
+                    33,
+                    'finding python 3.11',
+                )
+                loaded = generator._load_bootstrap_state(runtime)
+                self.assertEqual(loaded['percent'], 33)
+                self.assertEqual(loaded['step'], 'finding python 3.11')
+                self.assertIn('updated_at', loaded)
+                self.assertIn('last_heartbeat_at', loaded)
+                self.assertEqual(seen, [(33, 'finding python 3.11')])
+
     def test_runtime_status_without_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
@@ -65,6 +85,14 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 status = tool.runtime_status()
                 self.assertEqual(status['install_state'], 'not_installed')
                 self.assertEqual(status['percent'], 0)
+                self.assertEqual(status['step'], 'idle')
+                self.assertIn('message', status)
+                self.assertIn('updated_at', status)
+                self.assertIn('last_heartbeat_at', status)
+                self.assertIn('bootstrap_log', status)
+                self.assertIn('selected_python_source', status)
+                self.assertIn('selected_python', status)
+                self.assertIn('selected_python_version', status)
                 self.assertTrue(status['runtime_root'].endswith(tmp))
 
     def test_install_runtime_errors_when_python311_missing(self) -> None:
@@ -156,6 +184,55 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 generator._write_bootstrap_state(runtime, payload)
                 loaded = generator._load_bootstrap_state(runtime)
                 self.assertEqual(loaded['selected_python_source'], 'runtime_local_python')
+
+    def test_runtime_status_returns_persisted_intermediate_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                payload = generator._default_bootstrap_state(runtime)
+                payload.update(
+                    {
+                        'install_state': 'installing',
+                        'percent': 68,
+                        'step': 'installing torch',
+                        'message': 'installing torch',
+                        'bootstrap_log': str(runtime.logs_dir / 'bootstrap.log'),
+                    }
+                )
+                generator._write_bootstrap_state(runtime, payload)
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                status = tool.runtime_status()
+                self.assertEqual(status['install_state'], 'installing')
+                self.assertEqual(status['percent'], 68)
+                self.assertEqual(status['step'], 'installing torch')
+
+    def test_install_runtime_persists_ready_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                progress: list[tuple[int, str]] = []
+                with patch('generator._resolve_python311_command', return_value={
+                    'command': ['python3.11'],
+                    'selected_python': 'python3.11',
+                    'selected_python_version': '3.11.9',
+                    'selected_python_source': 'PATH_python',
+                    'attempts': [],
+                    'phases': [],
+                }), patch('generator._create_venv', return_value=None), patch('generator._bootstrap_runtime', return_value=None), patch(
+                    'generator._validate_runtime', return_value={'python': {'major': 3, 'minor': 11}, 'gpu': {'cuda': True}}
+                ):
+                    status = tool.install_runtime(progress_cb=lambda pct, step: progress.append((pct, step)))
+                self.assertEqual(status['install_state'], 'ready')
+                saved = generator._load_bootstrap_state(runtime)
+                self.assertEqual(saved['install_state'], 'ready')
+                self.assertEqual(saved['step'], 'ready')
+                self.assertGreaterEqual(saved['percent'], 100)
+                self.assertTrue(progress)
 
 
 if __name__ == '__main__':
