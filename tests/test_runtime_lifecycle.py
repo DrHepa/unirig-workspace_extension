@@ -58,6 +58,80 @@ generator = importlib.import_module('generator')
 
 
 class RuntimeLifecycleTests(unittest.TestCase):
+    def test_requirements_filter_removes_only_flash_attn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                req_path = runtime.repo_dir / 'requirements.txt'
+                req_path.write_text(
+                    '\n'.join(
+                        [
+                            'numpy==1.26.4',
+                            'flash_attn==2.8.3',
+                            'torchmetrics==1.4.0',
+                            'flash-attn>=2.0',
+                            'packaging',
+                        ]
+                    )
+                    + '\n',
+                    encoding='utf-8',
+                )
+                filtered = generator._create_filtered_requirements_file(runtime, req_path)
+                try:
+                    text = filtered.read_text(encoding='utf-8')
+                finally:
+                    filtered.unlink(missing_ok=True)
+                self.assertIn('numpy==1.26.4', text)
+                self.assertIn('torchmetrics==1.4.0', text)
+                self.assertIn('packaging', text)
+                self.assertNotIn('flash_attn==2.8.3', text)
+                self.assertNotIn('flash-attn>=2.0', text)
+
+    def test_install_official_requirements_uses_filtered_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'requirements.txt').write_text('numpy\nflash_attn\n', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                seen: list[list[str]] = []
+
+                def capture_cmd(*args: Any, **kwargs: Any) -> None:
+                    seen.append(list(args[3]))
+
+                with patch('generator._run_subprocess_with_heartbeat', side_effect=capture_cmd):
+                    generator._install_official_requirements(runtime, state, runtime.runtime_root / 'bootstrap.log')
+                self.assertTrue(seen)
+                pip_cmd = seen[0]
+                self.assertIn('-r', pip_cmd)
+                filtered_path = Path(pip_cmd[pip_cmd.index('-r') + 1])
+                self.assertIn('requirements_no_flash_attn', filtered_path.name)
+                self.assertFalse(filtered_path.exists())
+
+    def test_install_flash_attn_spec_uses_no_build_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                called: list[list[str]] = []
+
+                def capture_cmd(*args: Any, **kwargs: Any) -> None:
+                    called.append(list(args[3]))
+
+                with patch('generator._run_subprocess_with_heartbeat', side_effect=capture_cmd), patch(
+                    'generator._ensure_flash_attn_windows_toolchain',
+                    return_value=None,
+                ), patch('generator._query_flash_attn_version', return_value='2.7.4.post1'), patch(
+                    'generator._is_module_importable',
+                    return_value=True,
+                ):
+                    generator._install_flash_attn(runtime, state, runtime.runtime_root / 'bootstrap.log', profile, force=True)
+                install_cmd = called[-1]
+                self.assertIn('--no-build-isolation', install_cmd)
+
     def test_runtime_profile_resolver_prefers_win_cu128_on_windows_nvidia(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
@@ -240,6 +314,51 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     payload = generator._validate_runtime(runtime)
                 self.assertIn('imports', payload)
                 self.assertTrue(payload['runpy_smoke_ok'])
+
+    def test_required_imports_include_flash_attn(self) -> None:
+        modules = {name for name, _stmt in generator.REQUIRED_IMPORTS}
+        self.assertIn('flash_attn', modules)
+
+    def test_runtime_not_ready_if_flash_attn_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                (runtime.repo_dir / 'run.py').write_text('', encoding='utf-8')
+                (runtime.repo_dir / 'configs' / 'task').mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / generator.SKELETON_TASK).write_text('', encoding='utf-8')
+                (runtime.repo_dir / generator.SKIN_TASK).write_text('', encoding='utf-8')
+                (runtime.repo_dir / 'src' / 'inference').mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'src' / 'inference' / 'merge.py').write_text('', encoding='utf-8')
+                with patch('generator._run_capture', return_value='{"major":3,"minor":11,"micro":9}\n'), patch(
+                    'generator._query_runtime_info',
+                    return_value={'cuda': True, 'vram_gb': 16.0},
+                ), patch(
+                    'generator._query_required_import_validation',
+                    return_value={'results': {'flash_attn': 'error'}, 'missing_modules': ['flash_attn']},
+                ), patch('generator._validate_runpy_entrypoint', return_value={'ok': True}):
+                    payload = generator._validate_runtime(runtime)
+                self.assertFalse(payload['baseline_installed'])
+                self.assertIn('flash_attn', payload['missing_required_modules'])
+
+    def test_repair_missing_dependencies_resumes_from_flash_attn_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                with patch(
+                    'generator._query_missing_required_modules',
+                    side_effect=[['flash_attn'], []],
+                ), patch('generator._install_official_requirements') as install_official, patch(
+                    'generator._install_flash_attn',
+                ) as install_flash:
+                    generator._repair_missing_unirig_dependencies(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                install_official.assert_not_called()
+                install_flash.assert_called_once()
 
     def test_set_state_and_report_updates_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -645,11 +764,15 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 runtime.repo_dir.mkdir(parents=True, exist_ok=True)
                 (runtime.repo_dir / 'requirements.txt').write_text('lightning\n', encoding='utf-8')
                 state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
                 with patch('generator._query_missing_required_modules', side_effect=[['lightning'], []]), patch(
                     'generator._run_subprocess_with_heartbeat',
                     return_value=None,
-                ) as run_mock:
-                    generator._repair_missing_unirig_dependencies(runtime, state, runtime.runtime_root / 'bootstrap.log')
+                ) as run_mock, patch('generator._ensure_flash_attn_windows_toolchain', return_value=None), patch(
+                    'generator._query_flash_attn_version',
+                    return_value='2.7.4.post1',
+                ), patch('generator._is_module_importable', return_value=True):
+                    generator._repair_missing_unirig_dependencies(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
                 run_mock.assert_called()
                 self.assertEqual(state['missing_required_modules'], [])
 

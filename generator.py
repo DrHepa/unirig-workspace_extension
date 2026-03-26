@@ -26,7 +26,7 @@ from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 
 OFFICIAL_UNIRIG_ARCHIVE_URL = 'https://api.github.com/repos/VAST-AI-Research/UniRig/tarball/HEAD'
-BOOTSTRAP_VERSION = 4
+BOOTSTRAP_VERSION = 5
 PYTHON_STANDALONE_VERSION = '3.11.9'
 PYTHON_STANDALONE_RELEASE = '20240726'
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
@@ -39,6 +39,7 @@ PHASE_TIMEOUTS_SEC = {
     'creating venv': 900,
     'installing torch': 1800,
     'installing official requirements': 3600,
+    'installing flash-attn': 3600,
     'installing spconv/PyG': 3600,
     'validating CUDA': 900,
 }
@@ -69,6 +70,7 @@ REQUIRED_IMPORTS: list[tuple[str, str]] = [
     ('torch_scatter', 'import torch_scatter'),
     ('torch_cluster', 'import torch_cluster'),
     ('spconv', 'import spconv'),
+    ('flash_attn', 'import flash_attn'),
 ]
 
 
@@ -102,6 +104,7 @@ class RuntimeProfile:
     torch_cluster: str
     spconv_package: str
     cuda_flavor: str
+    flash_attn_spec: str
 
 
 class UniRigWorkspaceTool(BaseWorkspaceTool):
@@ -248,6 +251,9 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             state['missing_required_modules'] = validation.get('missing_required_modules', [])
             state['runpy_smoke_ok'] = bool(validation.get('runpy_smoke_ok'))
             state['required_baseline_installed'] = bool(validation.get('baseline_installed'))
+            state['flash_attn_validation_ok'] = 'flash_attn' not in state['missing_required_modules']
+            if state['flash_attn_validation_ok']:
+                state['flash_attn_last_error'] = ''
             state['last_validation_error'] = ''
             _write_bootstrap_state(runtime, state)
 
@@ -568,6 +574,7 @@ def get_supported_runtime_profiles() -> list[RuntimeProfile]:
             torch_cluster='1.6.3+pt27cu128',
             spconv_package='spconv-cu120',
             cuda_flavor='cu128',
+            flash_attn_spec='flash_attn==2.7.4.post1',
         ),
         RuntimeProfile(
             profile_id='win-cu126-stable',
@@ -581,6 +588,7 @@ def get_supported_runtime_profiles() -> list[RuntimeProfile]:
             torch_cluster='1.6.3+pt27cu126',
             spconv_package='spconv-cu120',
             cuda_flavor='cu126',
+            flash_attn_spec='flash_attn==2.7.4.post1',
         ),
     ]
 
@@ -694,6 +702,12 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'source_build_allowed': _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False),
         'required_baseline_source': '',
         'required_baseline_installed': False,
+        'flash_attn_required': True,
+        'flash_attn_spec': '',
+        'flash_attn_install_mode': '',
+        'flash_attn_version': '',
+        'flash_attn_validation_ok': False,
+        'flash_attn_last_error': '',
         'missing_required_modules': [],
         'runpy_smoke_ok': False,
         'last_validation_error': '',
@@ -1310,6 +1324,8 @@ def _bootstrap_runtime(
             'selected_torch_index_url': profile.torch_index_url,
             'binary_only_mode': True,
             'source_build_allowed': _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False),
+            'flash_attn_required': True,
+            'flash_attn_spec': os.environ.get('MODLY_UNIRIG_FLASH_ATTN_SPEC', '').strip() or profile.flash_attn_spec,
         }
     )
     _write_bootstrap_state(runtime, state)
@@ -1340,9 +1356,12 @@ def _bootstrap_runtime(
         phase_cb(76, 'installing official UniRig requirements')
     _install_official_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
     if phase_cb:
+        phase_cb(80, 'installing flash-attn')
+    _install_flash_attn(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
+    if phase_cb:
         phase_cb(84, 'installing spconv/PyG')
     _install_spconv_and_pyg(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
-    _repair_missing_unirig_dependencies(runtime, state, bootstrap_log, progress_cb=progress_cb)
+    _repair_missing_unirig_dependencies(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'ok')
 
 
@@ -1513,21 +1532,190 @@ def _install_official_requirements(
         _write_bootstrap_state(runtime, state)
         _log_bootstrap_event(log_path, 'installing official UniRig requirements', 'ok', 'skipped: marker exists')
         return
-    command = _pip_install_command(runtime, ['-r', str(requirements_path)])
-    _run_subprocess_with_heartbeat(
-        runtime,
-        state,
-        progress_cb,
-        command,
-        cwd=runtime.repo_dir,
-        log_path=log_path,
-        phase='installing official UniRig requirements',
-        timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
-    )
+    filtered_requirements = _create_filtered_requirements_file(runtime, requirements_path)
+    try:
+        command = _pip_install_command(runtime, ['-r', str(filtered_requirements)])
+        _run_subprocess_with_heartbeat(
+            runtime,
+            state,
+            progress_cb,
+            command,
+            cwd=runtime.repo_dir,
+            log_path=log_path,
+            phase='installing official UniRig requirements (excluding flash_attn for dedicated install phase)',
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
+        )
+    finally:
+        filtered_requirements.unlink(missing_ok=True)
     _mark_phase(runtime, 'official_requirements')
     _complete_phase(state, 'official_requirements')
     state['required_baseline_installed'] = True
     _write_bootstrap_state(runtime, state)
+
+
+def _create_filtered_requirements_file(runtime: RuntimeContext, requirements_path: Path) -> Path:
+    raw_lines = requirements_path.read_text(encoding='utf-8').splitlines()
+    filtered_lines = [line for line in raw_lines if not _is_flash_attn_requirement_line(line)]
+    temp_dir = runtime.runtime_root / '_tmp'
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        encoding='utf-8',
+        suffix='_requirements_no_flash_attn.txt',
+        prefix='unirig_',
+        dir=temp_dir,
+        delete=False,
+    ) as handle:
+        handle.write('\n'.join(filtered_lines))
+        handle.write('\n')
+        return Path(handle.name)
+
+
+def _is_flash_attn_requirement_line(line: str) -> bool:
+    text = line.strip()
+    if not text or text.startswith('#') or text.startswith('-'):
+        return False
+    if ' #' in text:
+        text = text.split(' #', 1)[0].strip()
+    match = re.match(r'^([A-Za-z0-9_.-]+)', text)
+    if not match:
+        return False
+    normalized = match.group(1).lower().replace('-', '_')
+    return normalized == 'flash_attn'
+
+
+def _install_flash_attn(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    profile: RuntimeProfile,
+    force: bool = False,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    if _phase_marked(runtime, 'flash_attn') and _is_module_importable(runtime, 'flash_attn') and not force:
+        state['flash_attn_validation_ok'] = True
+        state['flash_attn_last_error'] = ''
+        state['flash_attn_version'] = _query_flash_attn_version(runtime)
+        _complete_phase(state, 'flash_attn')
+        _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(log_path, 'installing flash-attn', 'ok', 'skipped: marker exists and module import succeeds')
+        return
+
+    flash_attn_spec = os.environ.get('MODLY_UNIRIG_FLASH_ATTN_SPEC', '').strip() or profile.flash_attn_spec
+    state['flash_attn_spec'] = flash_attn_spec
+    state['flash_attn_required'] = True
+    _write_bootstrap_state(runtime, state)
+
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        _pip_install_command(runtime, ['packaging', 'psutil', 'ninja']),
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='installing flash-attn',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing flash-attn'],
+    )
+
+    local_wheel = os.environ.get('MODLY_UNIRIG_FLASH_ATTN_WHEEL', '').strip()
+    wheel_url = os.environ.get('MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL', '').strip()
+    mode = ''
+    install_args: list[str]
+    if local_wheel:
+        mode = 'wheel_local'
+        install_args = [local_wheel]
+        _log_bootstrap_event(log_path, 'installing flash-attn', 'start', f'using local wheel override: {local_wheel}')
+    elif wheel_url:
+        mode = 'wheel_url'
+        install_args = [wheel_url]
+        _log_bootstrap_event(log_path, 'installing flash-attn', 'start', f'using wheel URL override: {wheel_url}')
+    else:
+        mode = 'spec_no_build_isolation'
+        _ensure_flash_attn_windows_toolchain(runtime)
+        install_args = [flash_attn_spec, '--no-build-isolation']
+        _log_bootstrap_event(
+            log_path,
+            'installing flash-attn',
+            'start',
+            f'installing from spec with --no-build-isolation: {flash_attn_spec}',
+        )
+
+    try:
+        _run_subprocess_with_heartbeat(
+            runtime,
+            state,
+            progress_cb,
+            _pip_install_command(runtime, install_args),
+            cwd=runtime.repo_dir,
+            log_path=log_path,
+            phase='installing flash-attn',
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing flash-attn'],
+        )
+        state['flash_attn_install_mode'] = mode
+        state['flash_attn_version'] = _query_flash_attn_version(runtime)
+        state['flash_attn_validation_ok'] = _is_module_importable(runtime, 'flash_attn')
+        state['flash_attn_last_error'] = ''
+        if not state['flash_attn_validation_ok']:
+            raise WorkspaceToolError('flash_attn installed but import validation failed.')
+        _mark_phase(runtime, 'flash_attn')
+        _complete_phase(state, 'flash_attn')
+        _write_bootstrap_state(runtime, state)
+    except Exception as exc:
+        state['flash_attn_install_mode'] = mode
+        state['flash_attn_validation_ok'] = False
+        state['flash_attn_last_error'] = str(exc)
+        _write_bootstrap_state(runtime, state)
+        raise
+
+
+def _ensure_flash_attn_windows_toolchain(runtime: RuntimeContext) -> None:
+    if platform.system().lower() != 'windows':
+        return
+    script = (
+        'import json, os, shutil; '
+        "payload={'cl': bool(shutil.which('cl.exe')), 'nvcc': bool(shutil.which('nvcc')), "
+        "'ninja': bool(shutil.which('ninja')), 'cuda_env': bool(os.environ.get('CUDA_PATH') or os.environ.get('CUDA_HOME'))}; "
+        'print(json.dumps(payload))'
+    )
+    output = _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir)
+    payload = _parse_last_json_line(output, 'Failed flash-attn Windows toolchain preflight')
+    has_cl = bool(payload.get('cl'))
+    has_nvcc = bool(payload.get('nvcc'))
+    has_ninja = bool(payload.get('ninja'))
+    has_cuda_env = bool(payload.get('cuda_env'))
+    if has_cl and has_ninja and (has_nvcc or has_cuda_env):
+        return
+    missing: list[str] = []
+    if not has_cl:
+        missing.append('cl.exe (MSVC build tools)')
+    if not has_ninja:
+        missing.append('ninja executable')
+    if not (has_nvcc or has_cuda_env):
+        missing.append('CUDA toolkit (nvcc or CUDA_PATH/CUDA_HOME)')
+    raise WorkspaceToolError(
+        'flash-attn source install preflight failed on Windows. Missing toolchain prerequisites: '
+        + ', '.join(missing)
+        + '. Provide MODLY_UNIRIG_FLASH_ATTN_WHEEL or MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL to use a prebuilt wheel.'
+    )
+
+
+def _query_flash_attn_version(runtime: RuntimeContext) -> str:
+    script = (
+        'import importlib.metadata as md; '
+        "version=''; "
+        "names=('flash-attn','flash_attn'); "
+        '\nfor name in names:\n'
+        '    try:\n'
+        '        version = md.version(name)\n'
+        '        break\n'
+        '    except Exception:\n'
+        '        continue\n'
+        'print(version)'
+    )
+    try:
+        return _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir).strip().splitlines()[-1]
+    except Exception:
+        return ''
 
 
 def _install_spconv_and_pyg(
@@ -1585,6 +1773,7 @@ def _repair_missing_unirig_dependencies(
     runtime: RuntimeContext,
     state: dict,
     log_path: Path,
+    profile: RuntimeProfile,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> None:
     missing = _query_missing_required_modules(runtime)
@@ -1599,7 +1788,11 @@ def _repair_missing_unirig_dependencies(
         'start',
         f"missing modules detected: {', '.join(missing)}",
     )
-    _install_official_requirements(runtime, state, log_path, force=True, progress_cb=progress_cb)
+    if set(missing) == {'flash_attn'}:
+        _install_flash_attn(runtime, state, log_path, profile, force=True, progress_cb=progress_cb)
+    else:
+        _install_official_requirements(runtime, state, log_path, force=True, progress_cb=progress_cb)
+        _install_flash_attn(runtime, state, log_path, profile, force=True, progress_cb=progress_cb)
     missing_after = _query_missing_required_modules(runtime)
     state['missing_required_modules'] = missing_after
     _write_bootstrap_state(runtime, state)
