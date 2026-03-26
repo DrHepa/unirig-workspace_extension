@@ -944,6 +944,117 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 run_mock.assert_called()
                 self.assertEqual(state['missing_required_modules'], [])
 
+    def test_windows_default_install_mode_is_artifact(self) -> None:
+        with patch('generator.platform.system', return_value='Windows'), patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(generator.resolve_install_mode(), 'artifact')
+
+    def test_artifact_mode_does_not_run_source_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp, 'MODLY_UNIRIG_INSTALL_MODE': 'artifact'}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                with patch('generator.resolve_runtime_profile', return_value=(profile, {'reason': 'test'})), patch(
+                    'generator._install_runtime_from_artifact',
+                    return_value=None,
+                ) as artifact_mock, patch(
+                    'generator._run_subprocess_with_heartbeat',
+                    return_value=None,
+                ), patch(
+                    'generator._repair_missing_unirig_dependencies',
+                    return_value=None,
+                ), patch(
+                    'generator._install_flash_attn',
+                    side_effect=AssertionError('source build should not run'),
+                ):
+                    generator._bootstrap_runtime(runtime, state, runtime.runtime_root / 'bootstrap.log', progress_cb=None)
+                artifact_mock.assert_called_once()
+
+    def test_missing_artifact_without_source_override_fails_clearly(self) -> None:
+        with patch.dict(os.environ, {'MODLY_UNIRIG_INSTALL_MODE': 'artifact', 'MODLY_UNIRIG_RUNTIME_MANIFEST_URL': 'https://invalid.local'}, clear=False):
+            with self.assertRaises(_WorkspaceToolError) as ctx:
+                generator._load_runtime_manifest('win-cu128-stable')
+        self.assertIn('UniRig runtime artifact unavailable', str(ctx.exception))
+
+    def test_artifact_install_uses_no_index_find_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                extracted = runtime.runtime_root / 'runtime_artifacts' / 'win-cu128-stable' / 'extracted'
+                (extracted / 'wheelhouse').mkdir(parents=True, exist_ok=True)
+                (extracted / 'runtime-lock.txt').write_text('torch==2.7.1+cu128\n', encoding='utf-8')
+                seen: list[list[str]] = []
+                with patch('generator._run_subprocess_with_heartbeat', side_effect=lambda *a, **k: seen.append(list(a[3]))):
+                    generator._install_from_wheelhouse(runtime, state, extracted, runtime.runtime_root / 'bootstrap.log')
+                self.assertTrue(seen)
+                command = seen[0]
+                self.assertIn('--no-index', command)
+                self.assertIn('--find-links', command)
+
+    def test_repair_in_artifact_mode_reuses_artifact_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                state = generator._default_bootstrap_state(runtime)
+                state['install_mode'] = 'artifact'
+                profile = generator.get_supported_runtime_profiles()[0]
+                with patch('generator._query_missing_required_modules', side_effect=[['torch_scatter'], []]), patch(
+                    'generator._install_runtime_from_artifact',
+                    return_value=None,
+                ) as artifact_mock:
+                    generator._repair_missing_unirig_dependencies(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                artifact_mock.assert_called_once()
+
+    def test_runtime_not_ready_without_required_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                with patch('generator._resolve_python311_command', return_value={
+                    'command': ['python3.11'],
+                    'selected_python': 'python3.11',
+                    'selected_python_version': '3.11.9',
+                    'selected_python_source': 'PATH_python',
+                    'attempts': [],
+                    'phases': [],
+                }), patch('generator._run_subprocess_with_heartbeat', return_value=None), patch(
+                    'generator._bootstrap_runtime',
+                    return_value=None,
+                ), patch(
+                    'generator._validate_runtime',
+                    return_value={'missing_required_modules': ['flash_attn'], 'runpy_smoke_ok': False, 'baseline_installed': False},
+                ):
+                    with self.assertRaises(_WorkspaceToolError):
+                        tool.install_runtime()
+                state = generator._load_bootstrap_state(runtime)
+                self.assertEqual(state['install_state'], 'error')
+                self.assertFalse(state['runtime_validation_ok'])
+
+    def test_artifact_mode_does_not_emit_cuda_1_28_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = generator.RuntimeContext(
+                runtime_root=Path(tmp),
+                repo_dir=Path(tmp),
+                venv_dir=Path(tmp) / 'venv',
+                python_exe=Path(tmp) / 'venv' / 'Scripts' / 'python.exe',
+                logs_dir=Path(tmp) / 'logs',
+                external_repo=False,
+            )
+            with patch('generator.resolve_runtime_profile', return_value=(generator.get_supported_runtime_profiles()[0], {})):
+                versions = generator._preferred_cuda_versions_from_profile(runtime)
+            self.assertNotIn('1.28', versions)
+            self.assertIn('12.8', versions)
+
     def test_no_custom_optional_core_dependency_split_exists(self) -> None:
         self.assertFalse(hasattr(generator, 'DEFAULT_PYG_OPTIONAL_PACKAGES'))
         self.assertFalse(hasattr(generator, '_split_requirements_groups'))
