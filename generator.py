@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 TOOL_ID = 'unirig-workspace-v1'
-BOOTSTRAP_VERSION = 11
+BOOTSTRAP_VERSION = 12
 
 TORCH_INDEX_URL = 'https://download.pytorch.org/whl/cu128'
 PYG_INDEX_URL = 'https://data.pyg.org/whl/torch-2.7.0+cu128.html'
@@ -25,8 +25,9 @@ FLASH_ATTN_WHEEL_DEFAULT = (
 )
 
 TORCH_PACKAGES = ['torch==2.7.0', 'torchvision==0.22.0', 'torchaudio==2.7.0']
-RUNTIME_PACKAGES = ['spconv-cu120', 'numpy==1.26.4', 'bpy==4.2', 'open3d', 'fast-simplification']
+SPCONV_PACKAGE = 'spconv-cu120'
 PYG_PACKAGES = ['torch_scatter==2.1.2+pt27cu128', 'torch_cluster==1.6.3+pt27cu128']
+NUMPY_PIN = 'numpy==1.26.4'
 
 DIRECT_INPUT_SUFFIXES = {'.obj', '.fbx', '.glb', '.vrm'}
 CONVERTIBLE_INPUT_SUFFIXES = {'.gltf', '.stl', '.ply'}
@@ -62,6 +63,7 @@ REQUIRED_IMPORTS: list[str] = [
 @dataclass
 class RuntimeContext:
     runtime_root: Path
+    runtime_vendor_dir: Path
     venv_dir: Path
     python_exe: Path
     logs_dir: Path
@@ -89,6 +91,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
     def runtime_status(self) -> dict:
         runtime = _resolve_runtime_context()
         state = _load_state(runtime)
+        runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
         if state.get('install_state') == 'ready' and not _runtime_ready(runtime):
             state['install_state'] = 'error'
             state['last_error'] = 'runtime files missing or vendor incomplete'
@@ -105,65 +108,58 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
 
         try:
             _ensure_windows_binary_path()
-            _create_venv(runtime)
-            _report(progress_cb, 20, 'venv ready')
-            _update_state(runtime, state, 20, 'venv ready')
 
-            _ensure_vendor(runtime, progress_cb)
-            _report(progress_cb, 30, 'vendor ready')
+            _report(progress_cb, 5, 'creating venv')
+            _create_venv(runtime)
+            _update_state(runtime, state, 15, 'venv ready')
+
+            _report(progress_cb, 20, 'building vendor')
+            _ensure_vendor(runtime)
             _update_state(runtime, state, 30, 'vendor ready')
 
             pip = [str(runtime.python_exe), '-m', 'pip']
             _run(pip + ['install', '--upgrade', 'pip', 'setuptools', 'wheel'])
 
-            _report(progress_cb, 42, 'installing torch cu128')
-            _run(pip + ['install', '--index-url', TORCH_INDEX_URL, *TORCH_PACKAGES])
-            _update_state(runtime, state, 42, 'torch installed')
+            _report(progress_cb, 40, 'installing torch cu128')
+            _run(pip + ['install', '--index-url', TORCH_INDEX_URL, *TORCH_PACKAGES], cwd=runtime.unirig_dir)
+            _update_state(runtime, state, 40, 'torch installed')
 
-            _report(progress_cb, 58, 'installing runtime wheels')
-            _run(pip + ['install', *RUNTIME_PACKAGES])
-            _update_state(runtime, state, 58, 'runtime wheels installed')
+            _report(progress_cb, 55, 'installing UniRig requirements')
+            _install_official_requirements_excluding_flash_attn(runtime)
+            _update_state(runtime, state, 55, 'requirements installed')
 
-            _report(progress_cb, 70, 'installing torch_scatter/torch_cluster')
-            _run(pip + ['install', '-f', PYG_INDEX_URL, *PYG_PACKAGES])
-            _update_state(runtime, state, 70, 'pyg deps installed')
+            _report(progress_cb, 68, 'installing spconv')
+            _run(pip + ['install', SPCONV_PACKAGE], cwd=runtime.unirig_dir)
+            _update_state(runtime, state, 68, 'spconv installed')
 
-            _report(progress_cb, 82, 'installing flash-attn wheel')
+            _report(progress_cb, 76, 'installing torch_scatter/torch_cluster')
+            _run(pip + ['install', '-f', PYG_INDEX_URL, '--no-cache-dir', *PYG_PACKAGES], cwd=runtime.unirig_dir)
+            _update_state(runtime, state, 76, 'pyg deps installed')
+
+            _report(progress_cb, 82, 'pinning numpy')
+            _run(pip + ['install', NUMPY_PIN], cwd=runtime.unirig_dir)
+            _update_state(runtime, state, 82, 'numpy pinned')
+
+            _report(progress_cb, 88, 'installing flash-attn wheel')
             _install_flash_attn(runtime)
-            _update_state(runtime, state, 82, 'flash-attn installed')
+            _update_state(runtime, state, 88, 'flash-attn installed')
 
             py_path = _vendor_pythonpath(runtime)
-            _report(progress_cb, 90, 'validating imports')
+            _report(progress_cb, 94, 'validating imports')
             missing = _missing_imports(runtime, py_path)
             if missing:
                 raise WorkspaceToolError(f'missing imports: {", ".join(missing)}')
 
-            _report(progress_cb, 96, 'validating run.py --help')
+            _report(progress_cb, 97, 'validating run.py --help')
             _run([str(runtime.python_exe), 'run.py', '--help'], cwd=runtime.unirig_dir, extra_env={'PYTHONPATH': py_path})
 
-            state.update(
-                {
-                    'install_state': 'ready',
-                    'step': 'ready',
-                    'percent': 100,
-                    'last_error': '',
-                    'updated_at': int(time.time()),
-                    'python_exe': str(runtime.python_exe),
-                }
-            )
+            state.update({'install_state': 'ready', 'step': 'ready', 'percent': 100, 'last_error': '', 'updated_at': int(time.time())})
             _save_state(runtime, state)
             self._runtime = runtime
             _report(progress_cb, 100, 'ready')
             return state
         except Exception as exc:
-            state.update(
-                {
-                    'install_state': 'error',
-                    'step': 'failed',
-                    'last_error': str(exc),
-                    'updated_at': int(time.time()),
-                }
-            )
+            state.update({'install_state': 'error', 'step': 'failed', 'last_error': str(exc), 'updated_at': int(time.time())})
             _save_state(runtime, state)
             raise WorkspaceToolError(f'Failed to install UniRig runtime: {exc}') from exc
 
@@ -293,6 +289,17 @@ def _load_state(runtime: RuntimeContext) -> dict:
 
 
 def _save_state(runtime: RuntimeContext, state: dict) -> None:
+    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
+    state.update(
+        {
+            'bootstrap_version': BOOTSTRAP_VERSION,
+            'runtime_root': str(runtime.runtime_root),
+            'vendor_dir': str(runtime.active_vendor_dir),
+            'unirig_dir': str(runtime.unirig_dir),
+            'venv_dir': str(runtime.venv_dir),
+            'python_exe': str(runtime.python_exe),
+        }
+    )
     path = _state_path(runtime)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding='utf-8')
@@ -309,68 +316,80 @@ def _resolve_runtime_context() -> RuntimeContext:
     extension_root = Path(__file__).resolve().parent
     extension_vendor_dir = extension_root / 'vendor'
 
-    override = os.environ.get('MODLY_UNIRIG_RUNTIME_DIR')
+    override = os.environ.get('MODLY_UNIRIG_RUNTIME_DIR', '').strip()
     if override:
         runtime_root = Path(override).expanduser().resolve()
     else:
-        user_data = os.environ.get('MODLY_USERDATA_DIR')
+        user_data = os.environ.get('MODLY_USERDATA_DIR', '').strip()
         if user_data:
             runtime_root = Path(user_data).expanduser().resolve() / 'dependencies' / TOOL_ID
         else:
             runtime_root = Path.home() / '.cache' / 'modly' / TOOL_ID
+
+    runtime_vendor_dir = runtime_root / 'vendor'
     venv_dir = runtime_root / 'venv'
     python_exe = venv_dir / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     logs_dir = runtime_root / 'logs'
-    active_vendor_dir, unirig_dir = _resolve_active_vendor_dirs(extension_vendor_dir)
-    return RuntimeContext(
+
+    runtime = RuntimeContext(
         runtime_root=runtime_root,
+        runtime_vendor_dir=runtime_vendor_dir,
         venv_dir=venv_dir,
         python_exe=python_exe,
         logs_dir=logs_dir,
         extension_root=extension_root,
         extension_vendor_dir=extension_vendor_dir,
-        active_vendor_dir=active_vendor_dir,
-        unirig_dir=unirig_dir,
+        active_vendor_dir=runtime_vendor_dir,
+        unirig_dir=runtime_vendor_dir / 'unirig',
     )
+    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
+    return runtime
 
 
-def _resolve_active_vendor_dirs(extension_vendor_dir: Path) -> tuple[Path, Path]:
-    if _validate_vendor_dir(extension_vendor_dir):
-        return extension_vendor_dir, extension_vendor_dir / 'unirig'
-    return extension_vendor_dir, extension_vendor_dir / 'unirig'
+def _resolve_active_vendor_dirs(runtime: RuntimeContext) -> tuple[Path, Path]:
+    if _validate_vendor_dir(runtime.runtime_vendor_dir):
+        return runtime.runtime_vendor_dir, runtime.runtime_vendor_dir / 'unirig'
+    if _validate_vendor_dir(runtime.extension_vendor_dir):
+        return runtime.extension_vendor_dir, runtime.extension_vendor_dir / 'unirig'
+    return runtime.runtime_vendor_dir, runtime.runtime_vendor_dir / 'unirig'
 
 
 def _required_vendor_paths(vendor_dir: Path) -> list[Path]:
-    return [vendor_dir / 'unirig' / 'run.py', vendor_dir / 'unirig' / 'src', vendor_dir / 'unirig' / 'configs']
+    return [
+        vendor_dir / 'unirig' / 'run.py',
+        vendor_dir / 'unirig' / 'src',
+        vendor_dir / 'unirig' / 'configs',
+        vendor_dir / 'unirig' / 'requirements.txt',
+    ]
 
 
 def _validate_vendor_dir(vendor_dir: Path) -> bool:
     return all(path.exists() for path in _required_vendor_paths(vendor_dir))
 
 
-def _ensure_vendor(runtime: RuntimeContext, progress_cb: Optional[Callable[[int, str], None]] = None) -> None:
-    if _validate_vendor_dir(runtime.extension_vendor_dir):
-        runtime.active_vendor_dir = runtime.extension_vendor_dir
-        runtime.unirig_dir = runtime.active_vendor_dir / 'unirig'
-    else:
-        required = ', '.join(str(p) for p in _required_vendor_paths(runtime.extension_vendor_dir))
-        raise WorkspaceToolError(
-            'Missing vendored UniRig sources. Run build_vendor.py in the extension root to populate vendor/. '
-            f'Required: {required}'
-        )
+def _ensure_vendor(runtime: RuntimeContext) -> None:
+    if not _validate_vendor_dir(runtime.runtime_vendor_dir) and not _validate_vendor_dir(runtime.extension_vendor_dir):
+        _build_runtime_vendor(runtime)
 
-    vendor_str = str(runtime.active_vendor_dir)
-    unirig_str = str(runtime.unirig_dir)
-    if vendor_str not in sys_path_list():
-        sys_path_list().insert(0, vendor_str)
-    if unirig_str not in sys_path_list():
-        sys_path_list().insert(0, unirig_str)
+    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
+    if not _validate_vendor_dir(runtime.active_vendor_dir):
+        required = ', '.join(str(p) for p in _required_vendor_paths(runtime.active_vendor_dir))
+        raise WorkspaceToolError(f'vendor/ is incomplete. Missing: {required}')
 
 
-def sys_path_list() -> list[str]:
-    import sys
-
-    return sys.path
+def _build_runtime_vendor(runtime: RuntimeContext) -> None:
+    runtime.runtime_vendor_dir.parent.mkdir(parents=True, exist_ok=True)
+    build_vendor_py = runtime.extension_root / 'build_vendor.py'
+    if not build_vendor_py.exists():
+        raise WorkspaceToolError('build_vendor.py is missing from the extension root.')
+    cmd = [sys.executable, str(build_vendor_py), '--dest', str(runtime.runtime_vendor_dir)]
+    source_zip = os.environ.get('MODLY_UNIRIG_SOURCE_ZIP', '').strip()
+    if source_zip:
+        cmd.extend(['--source-zip', source_zip])
+    ref = os.environ.get('MODLY_UNIRIG_REPO_REF', '').strip()
+    if ref:
+        cmd.extend(['--ref', ref])
+    _run(cmd, cwd=runtime.extension_root)
 
 
 def _vendor_pythonpath(runtime: RuntimeContext) -> str:
@@ -387,27 +406,69 @@ def _ensure_windows_binary_path() -> None:
 
 
 def _runtime_ready(runtime: RuntimeContext) -> bool:
-    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime.extension_vendor_dir)
+    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
     state = _load_state(runtime)
-    return state.get('install_state') == 'ready' and runtime.python_exe.exists() and (runtime.unirig_dir / 'run.py').exists()
+    return state.get('install_state') == 'ready' and runtime.python_exe.exists() and _validate_vendor_dir(runtime.active_vendor_dir)
+
+
+def _python_cmd_is_311(cmd: list[str]) -> bool:
+    try:
+        result = subprocess.run(cmd + ['-c', 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")'], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == '3.11'
 
 
 def _resolve_python311_cmd() -> list[str]:
     env_bin = os.environ.get('MODLY_UNIRIG_PYTHON311_BIN', '').strip()
+    candidates: list[list[str]] = []
     if env_bin:
-        return [env_bin]
+        candidates.append([env_bin])
+
+    if sys.version_info[:2] == (3, 11) and sys.executable:
+        candidates.append([sys.executable])
+
+    modly_python = os.environ.get('MODLY_PYTHON_EXE', '').strip()
+    if modly_python:
+        candidates.append([modly_python])
+
+    for raw in [shutil.which('python3.11'), shutil.which('python')]:
+        if raw:
+            candidates.append([raw])
     if shutil.which('py'):
-        return ['py', '-3.11']
-    if shutil.which('python3.11'):
-        return ['python3.11']
-    raise WorkspaceToolError('Python 3.11 not found. Set MODLY_UNIRIG_PYTHON311_BIN or install Python 3.11.')
+        candidates.append(['py', '-3.11'])
+
+    seen: set[tuple[str, ...]] = set()
+    for cmd in candidates:
+        key = tuple(cmd)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _python_cmd_is_311(cmd):
+            return cmd
+    raise WorkspaceToolError('Python 3.11 runtime not found. Set MODLY_UNIRIG_PYTHON311_BIN or run Modly with its bundled Python 3.11 backend.')
 
 
 def _create_venv(runtime: RuntimeContext) -> None:
     if runtime.python_exe.exists():
         return
+    runtime.venv_dir.parent.mkdir(parents=True, exist_ok=True)
     py311_cmd = _resolve_python311_cmd()
     _run([*py311_cmd, '-m', 'venv', str(runtime.venv_dir)], cwd=runtime.runtime_root)
+
+
+def _install_official_requirements_excluding_flash_attn(runtime: RuntimeContext) -> None:
+    req_path = runtime.unirig_dir / 'requirements.txt'
+    if not req_path.exists():
+        raise WorkspaceToolError(f'Missing vendored requirements.txt at {req_path}')
+    filtered_path = runtime.runtime_root / 'requirements.unirig.filtered.txt'
+    lines = []
+    for raw in req_path.read_text(encoding='utf-8').splitlines():
+        if 'flash_attn' in raw.replace('-', '_').lower():
+            continue
+        lines.append(raw)
+    filtered_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    _run([str(runtime.python_exe), '-m', 'pip', 'install', '-r', str(filtered_path)], cwd=runtime.unirig_dir)
 
 
 def _install_flash_attn(runtime: RuntimeContext) -> None:
@@ -421,13 +482,13 @@ def _install_flash_attn(runtime: RuntimeContext) -> None:
             urllib.request.urlretrieve(wheel_url, str(wheel_path))
         _run([str(runtime.python_exe), '-m', 'pip', 'install', str(wheel_path)])
     except Exception as exc:
-        _append_flash_log(runtime, f'wheel_url={wheel_url}\nerror={exc}')
+        _append_log(runtime, 'flash_attn_install.log', f'wheel_url={wheel_url}\nerror={exc}')
         raise WorkspaceToolError('flash-attn wheel install failed') from exc
 
 
-def _append_flash_log(runtime: RuntimeContext, detail: str) -> None:
+def _append_log(runtime: RuntimeContext, filename: str, detail: str) -> None:
     runtime.logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = runtime.logs_dir / 'flash_attn_install.log'
+    log_file = runtime.logs_dir / filename
     with log_file.open('a', encoding='utf-8') as handle:
         handle.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}] {detail}\n')
 
@@ -472,7 +533,7 @@ def _run(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] 
         env.update(extra_env)
     result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout or '').strip().splitlines()[-40:]
+        tail = (result.stderr or result.stdout or '').strip().splitlines()[-60:]
         raise WorkspaceToolError(f'Command failed: {" ".join(command)}\n' + '\n'.join(tail))
 
 
@@ -482,7 +543,7 @@ def _run_capture(command: list[str], cwd: Path | None = None, extra_env: dict[st
         env.update(extra_env)
     result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout or '').strip().splitlines()[-40:]
+        tail = (result.stderr or result.stdout or '').strip().splitlines()[-60:]
         raise WorkspaceToolError(f'Command failed: {" ".join(command)}\n' + '\n'.join(tail))
     return result.stdout or result.stderr or ''
 

@@ -3,82 +3,67 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
 
 UPSTREAM_REPO = 'VAST-AI-Research/UniRig'
-UPSTREAM_REF = '6de22e7536f4f75ec1bf632f761fbdf43f5af7cf'
-UPSTREAM_ZIP_URL = f'https://github.com/{UPSTREAM_REPO}/archive/{UPSTREAM_REF}.zip'
-
+DEFAULT_REF = os.environ.get('MODLY_UNIRIG_REPO_REF', 'main')
 ROOT = Path(__file__).resolve().parent
 DEFAULT_VENDOR_DIR = ROOT / 'vendor'
 
-UNIRIG_REQUIRED_PATHS = ['run.py', 'src', 'configs']
-OPTIONAL_UNIRIG_PATHS = ['requirements.txt']
-
-PURE_PYTHON_VENDOR = [
-    'python-box',
-    'einops',
-    'omegaconf',
-    'antlr4-python3-runtime',
-    'PyYAML',
-    'lightning',
-    'pytorch_lightning',
-    'addict',
-    'timm',
-    'huggingface_hub',
-    'wandb',
-    'trimesh',
-    'pyrender',
-    'requests',
-    'tqdm',
-    'regex',
-    'transformers',
-]
-
-OFFLINE_STUB_MODULES = {
-    'box': 'class Box(dict):\n    pass\n',
-    'einops': '__all__ = []\n',
-    'omegaconf': '__all__ = []\n',
-    'antlr4': '__all__ = []\n',
-    'yaml': '__all__ = []\n',
-    'lightning': '__all__ = []\n',
-    'pytorch_lightning': '__all__ = []\n',
-    'addict': '__all__ = []\n',
-    'timm': '__all__ = []\n',
-    'huggingface_hub': '__all__ = []\n',
-    'wandb': '__all__ = []\n',
-    'trimesh': '__all__ = []\n',
-    'pyrender': '__all__ = []\n',
-    'requests': '__all__ = []\n',
-    'tqdm': '__all__ = []\n',
-    'regex': '__all__ = []\n',
-    'transformers': '__all__ = []\n',
-}
+REQUIRED_PATHS = ['run.py', 'src', 'configs', 'requirements.txt']
+OPTIONAL_PATHS = ['launch', 'blender']
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> None:
-    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+def _archive_url_for_ref(ref: str) -> str:
+    ref = (ref or 'main').strip()
+    if len(ref) >= 7 and all(c in '0123456789abcdefABCDEF' for c in ref):
+        return f'https://github.com/{UPSTREAM_REPO}/archive/{ref}.zip'
+    return f'https://github.com/{UPSTREAM_REPO}/archive/refs/heads/{ref}.zip'
+
+
+def _resolve_source(source_override: str | None, ref: str | None) -> str:
+    env_source = os.environ.get('MODLY_UNIRIG_SOURCE_ZIP', '').strip()
+    raw = (source_override or env_source or '').strip()
+    if raw:
+        return raw
+    return _archive_url_for_ref(ref or DEFAULT_REF)
 
 
 def _resolve_dest(dest_override: str | None) -> Path:
     env_dest = os.environ.get('MODLY_UNIRIG_VENDOR_DIR', '').strip()
-    raw = dest_override or env_dest
+    raw = (dest_override or env_dest or '').strip()
     if not raw:
         return DEFAULT_VENDOR_DIR
     return Path(raw).expanduser().resolve()
 
 
-def _copy_required_unirig_tree(source_root: Path, vendor_dir: Path) -> Path:
+def _fetch_archive(source: str, dst_zip: Path) -> None:
+    source_path = Path(source)
+    if source_path.exists():
+        shutil.copy2(source_path, dst_zip)
+        return
+    urllib.request.urlretrieve(source, str(dst_zip))
+
+
+def _locate_upstream_root(unpack_dir: Path) -> Path:
+    roots = [p for p in unpack_dir.iterdir() if p.is_dir()]
+    if len(roots) != 1:
+        raise RuntimeError(f'Unexpected archive layout in {unpack_dir}: {[p.name for p in roots]}')
+    root = roots[0]
+    if not (root / 'run.py').exists() and (root / 'UniRig' / 'run.py').exists():
+        root = root / 'UniRig'
+    return root
+
+
+def _copy_tree(source_root: Path, vendor_dir: Path) -> None:
     unirig_dir = vendor_dir / 'unirig'
     unirig_dir.mkdir(parents=True, exist_ok=True)
 
     missing: list[str] = []
-    for rel in UNIRIG_REQUIRED_PATHS:
+    for rel in REQUIRED_PATHS:
         src = source_root / rel
         dst = unirig_dir / rel
         if not src.exists():
@@ -94,10 +79,10 @@ def _copy_required_unirig_tree(source_root: Path, vendor_dir: Path) -> Path:
         raise RuntimeError(
             'Upstream UniRig ZIP structure changed. Missing required paths: '
             + ', '.join(missing)
-            + f'. Expected base: {source_root}'
+            + f'. Source root: {source_root}'
         )
 
-    for rel in OPTIONAL_UNIRIG_PATHS:
+    for rel in OPTIONAL_PATHS:
         src = source_root / rel
         if not src.exists():
             continue
@@ -108,110 +93,46 @@ def _copy_required_unirig_tree(source_root: Path, vendor_dir: Path) -> Path:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
-    return unirig_dir
-
 
 def _validate_vendor(vendor_dir: Path) -> None:
-    required = [
-        vendor_dir / 'unirig' / 'run.py',
-        vendor_dir / 'unirig' / 'src',
-        vendor_dir / 'unirig' / 'configs',
-    ]
-    missing = [str(p) for p in required if not p.exists()]
+    required = [vendor_dir / 'unirig' / rel for rel in REQUIRED_PATHS]
+    missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise RuntimeError('Vendor build incomplete. Missing: ' + ', '.join(missing))
 
 
-def _write_offline_unirig_snapshot(vendor_dir: Path) -> None:
-    unirig_dir = vendor_dir / 'unirig'
-    (unirig_dir / 'src' / 'inference').mkdir(parents=True, exist_ok=True)
-    (unirig_dir / 'configs' / 'task').mkdir(parents=True, exist_ok=True)
-    (unirig_dir / 'run.py').write_text(
-        """import argparse\n\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser(description='UniRig CLI (offline fallback)')\n    parser.add_argument('--task')\n    parser.add_argument('--seed')\n    parser.add_argument('--input')\n    parser.add_argument('--output')\n    parser.add_argument('--npz_dir')\n    parser.add_argument('--data_name')\n    parser.parse_args()\n""",
-        encoding='utf-8',
-    )
-    (unirig_dir / 'src' / '__init__.py').write_text('', encoding='utf-8')
-    (unirig_dir / 'src' / 'inference' / '__init__.py').write_text('', encoding='utf-8')
-    (unirig_dir / 'src' / 'inference' / 'merge.py').write_text(
-        """import argparse\n\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser(description='UniRig merge CLI (offline fallback)')\n    parser.add_argument('--require_suffix')\n    parser.add_argument('--num_runs')\n    parser.add_argument('--id')\n    parser.add_argument('--source')\n    parser.add_argument('--target')\n    parser.add_argument('--output')\n    parser.parse_args()\n""",
-        encoding='utf-8',
-    )
-    (unirig_dir / 'configs' / 'task' / 'quick_inference_skeleton_articulationxl_ar_256.yaml').write_text(
-        'name: skeleton_fallback\n',
-        encoding='utf-8',
-    )
-    (unirig_dir / 'configs' / 'task' / 'quick_inference_unirig_skin.yaml').write_text(
-        'name: skin_fallback\n',
-        encoding='utf-8',
-    )
-
-
-def _install_pure_python_vendor(vendor_dir: Path) -> None:
-    try:
-        _run(
-            [
-                sys.executable,
-                '-m',
-                'pip',
-                'install',
-                '--target',
-                str(vendor_dir),
-                '--no-deps',
-                '--upgrade',
-                *PURE_PYTHON_VENDOR,
-            ]
-        )
-    except Exception:
-        for mod, content in OFFLINE_STUB_MODULES.items():
-            mod_dir = vendor_dir / mod
-            mod_dir.mkdir(parents=True, exist_ok=True)
-            (mod_dir / '__init__.py').write_text(content, encoding='utf-8')
-
-
-def _locate_upstream_root(unpack_dir: Path) -> Path:
-    roots = [p for p in unpack_dir.iterdir() if p.is_dir()]
-    if len(roots) != 1:
-        raise RuntimeError(f'Unexpected archive layout in {unpack_dir}: {roots}')
-    source_root = roots[0]
-    if not (source_root / 'run.py').exists() and (source_root / 'UniRig' / 'run.py').exists():
-        source_root = source_root / 'UniRig'
-    return source_root
-
-
-def rebuild_vendor(dest_override: str | None = None) -> Path:
+def rebuild_vendor(dest_override: str | None = None, source_override: str | None = None, ref_override: str | None = None) -> Path:
     vendor_dir = _resolve_dest(dest_override)
     if vendor_dir.exists():
         shutil.rmtree(vendor_dir)
     vendor_dir.mkdir(parents=True, exist_ok=True)
 
+    source = _resolve_source(source_override, ref_override)
     with tempfile.TemporaryDirectory(prefix='unirig_vendor_') as tmp:
         tmp_root = Path(tmp)
-        zip_path = tmp_root / f'unirig-{UPSTREAM_REF}.zip'
-        try:
-            urllib.request.urlretrieve(UPSTREAM_ZIP_URL, str(zip_path))
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                if not zf.namelist():
-                    raise RuntimeError(f'Failed to download valid ZIP from {UPSTREAM_ZIP_URL}')
+        zip_path = tmp_root / 'unirig.zip'
+        _fetch_archive(source, zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            if not zf.namelist():
+                raise RuntimeError(f'Failed to read UniRig ZIP from: {source}')
+        unpack_dir = tmp_root / 'unpack'
+        shutil.unpack_archive(str(zip_path), str(unpack_dir))
+        source_root = _locate_upstream_root(unpack_dir)
+        _copy_tree(source_root, vendor_dir)
 
-            unpack_dir = tmp_root / 'unpack'
-            shutil.unpack_archive(str(zip_path), str(unpack_dir))
-            source_root = _locate_upstream_root(unpack_dir)
-            _copy_required_unirig_tree(source_root, vendor_dir)
-        except Exception:
-            _write_offline_unirig_snapshot(vendor_dir)
-
-    _install_pure_python_vendor(vendor_dir)
     _validate_vendor(vendor_dir)
     return vendor_dir
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Rebuild vendored UniRig source and pure-Python dependencies.')
-    parser.add_argument('--dest', type=str, default=None, help='Destination vendor directory (overrides default and env).')
+    parser = argparse.ArgumentParser(description='Download and vendor the UniRig source tree required for runtime inference.')
+    parser.add_argument('--dest', default=None, help='Destination vendor directory. Defaults to ./vendor or MODLY_UNIRIG_VENDOR_DIR.')
+    parser.add_argument('--source-zip', default=None, help='Local path or URL for a UniRig ZIP archive. Defaults to MODLY_UNIRIG_SOURCE_ZIP or the pinned ref URL.')
+    parser.add_argument('--ref', default=None, help='Git ref to resolve when --source-zip is not provided. Defaults to MODLY_UNIRIG_REPO_REF or main.')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = _parse_args()
-    built = rebuild_vendor(dest_override=args.dest)
+    built = rebuild_vendor(dest_override=args.dest, source_override=args.source_zip, ref_override=args.ref)
     print(f'vendor ready at: {built}')
