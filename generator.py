@@ -1335,15 +1335,6 @@ def _repair_incompatible_runtime_stack(
 ) -> None:
     if not runtime.python_exe.exists():
         return
-    try:
-        torch_build = _query_torch_build(runtime)
-    except Exception:
-        torch_build = {}
-    installed_torch = str(torch_build.get('version', ''))
-    expected_torch = profile.torch
-    incompatible = bool(installed_torch and installed_torch != expected_torch)
-    if not incompatible and _phase_marked(runtime, 'spconv_pyg'):
-        return
     packages = [
         'torch',
         'torchvision',
@@ -1355,23 +1346,89 @@ def _repair_incompatible_runtime_stack(
         'spconv',
         'spconv-cu120',
     ]
+    try:
+        torch_build = _query_torch_build(runtime)
+    except Exception:
+        torch_build = {}
+    try:
+        detected_packages = _query_installed_packages(runtime, packages)
+    except Exception:
+        detected_packages = {}
+
+    installed_torch = str(torch_build.get('version', ''))
+    expected_torch = profile.torch
+    present_packages = sorted(detected_packages.keys())
+    state['repair_detected_packages'] = detected_packages
+
+    incompatible_torch = bool(installed_torch and installed_torch != expected_torch)
+    if not present_packages:
+        reason = 'no incompatible packages detected'
+        state['repair_skipped_reason'] = reason
+        state['repair_selected_packages'] = []
+        _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(
+            log_path,
+            'repair runtime stack',
+            'ok',
+            f"skipped: {reason} (installed={installed_torch or 'missing'}, expected={expected_torch}, detected=none)",
+        )
+        return
+
+    residual_packages = {
+        'torch-scatter',
+        'torch-cluster',
+        'torch-sparse',
+        'pyg-lib',
+        'spconv',
+        'spconv-cu120',
+    }
+    residual_detected = sorted(pkg for pkg in present_packages if pkg in residual_packages)
+    should_repair = incompatible_torch or (not installed_torch and bool(residual_detected))
+    if not should_repair:
+        reason = 'compatible stack detected; cleanup not required'
+        state['repair_skipped_reason'] = reason
+        state['repair_selected_packages'] = []
+        _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(
+            log_path,
+            'repair runtime stack',
+            'ok',
+            f"skipped: {reason} (installed={installed_torch or 'missing'}, expected={expected_torch}, detected={present_packages})",
+        )
+        return
+
+    selected_packages = present_packages if incompatible_torch else residual_detected
+    if not selected_packages:
+        reason = 'no incompatible packages detected'
+        state['repair_skipped_reason'] = reason
+        state['repair_selected_packages'] = []
+        _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(log_path, 'repair runtime stack', 'ok', f'skipped: {reason}')
+        return
+
+    state['repair_skipped_reason'] = ''
+    state['repair_selected_packages'] = selected_packages
+    _write_bootstrap_state(runtime, state)
     _log_bootstrap_event(
         log_path,
         'repair runtime stack',
         'start',
-        f"partial uninstall due to incompatible stack (installed={installed_torch or 'missing'}, expected={expected_torch})",
+        (
+            f"partial uninstall due to incompatible stack (installed={installed_torch or 'missing'}, "
+            f"expected={expected_torch}, detected={present_packages}, selected={selected_packages})"
+        ),
     )
     _run_subprocess_with_heartbeat(
         runtime,
         state,
         progress_cb,
-        _pip_uninstall_command(runtime, ['-y', *packages]),
+        _pip_uninstall_command(runtime, ['-y', *selected_packages]),
         cwd=runtime.repo_dir,
         log_path=log_path,
         phase='repairing incompatible torch/PyG stack',
         timeout_sec=PHASE_TIMEOUTS_SEC['installing torch'],
     )
-    _log_bootstrap_event(log_path, 'repair runtime stack', 'ok', 'partial cleanup completed')
+    _log_bootstrap_event(log_path, 'repair runtime stack', 'ok', f'partial cleanup completed ({selected_packages})')
 
 
 def _install_torch(
@@ -1616,19 +1673,11 @@ def _install_spconv_and_pyg(
 
 
 def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
-    return _pip_command(runtime, 'install', args)
-
-
-def _pip_uninstall_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
-    return _pip_command(runtime, 'uninstall', args)
-
-
-def _pip_command(runtime: RuntimeContext, pip_subcommand: str, args: Sequence[str]) -> list[str]:
     cmd = [
         str(runtime.python_exe),
         '-m',
         'pip',
-        pip_subcommand,
+        'install',
         '--disable-pip-version-check',
         '--progress-bar',
         'off',
@@ -1636,9 +1685,39 @@ def _pip_command(runtime: RuntimeContext, pip_subcommand: str, args: Sequence[st
         *args,
     ]
     wheelhouse = os.environ.get('MODLY_UNIRIG_WHEELHOUSE_DIR')
-    if wheelhouse and pip_subcommand == 'install':
+    if wheelhouse:
         cmd.extend(['--no-index', '--find-links', wheelhouse])
     return cmd
+
+
+def _pip_uninstall_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
+    return [
+        str(runtime.python_exe),
+        '-m',
+        'pip',
+        'uninstall',
+        '--disable-pip-version-check',
+        '--no-input',
+        *args,
+    ]
+
+
+def _query_installed_packages(runtime: RuntimeContext, package_names: Sequence[str]) -> dict[str, str]:
+    script = (
+        'import json; '
+        'import importlib.metadata as md; '
+        f'packages={list(package_names)!r}; '
+        'found={}; '
+        'for name in packages:\n'
+        '    try:\n'
+        '        found[name]=md.version(name)\n'
+        '    except md.PackageNotFoundError:\n'
+        '        continue\n'
+        'print(json.dumps(found))'
+    )
+    output = _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir)
+    payload = _parse_last_json_line(output, 'Failed to query installed runtime packages')
+    return payload if isinstance(payload, dict) else {}
 
 
 def _query_torch_build(runtime: RuntimeContext) -> dict:

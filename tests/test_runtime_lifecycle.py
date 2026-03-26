@@ -108,11 +108,111 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     called.append(list(args[3]))
 
                 with patch('generator._query_torch_build', return_value={'version': '2.11.0+cpu'}), patch(
+                    'generator._query_installed_packages',
+                    return_value={'torch': '2.11.0+cpu', 'torch-scatter': '2.1.2', 'spconv-cu120': '2.3.8'},
+                ), patch(
                     'generator._run_subprocess_with_heartbeat',
                     side_effect=capture_cmd,
                 ):
                     generator._repair_incompatible_runtime_stack(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
                 self.assertTrue(any('uninstall' in cmd for cmd in called))
+                uninstall_cmd = next(cmd for cmd in called if 'uninstall' in cmd)
+                self.assertIn('torch', uninstall_cmd)
+                self.assertIn('torch-scatter', uninstall_cmd)
+                self.assertIn('spconv-cu120', uninstall_cmd)
+                self.assertEqual(state['repair_selected_packages'], ['spconv-cu120', 'torch', 'torch-scatter'])
+
+    def test_pip_uninstall_command_excludes_progress_bar_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                cmd = generator._pip_uninstall_command(runtime, ['-y', 'torch'])
+                self.assertIn('uninstall', cmd)
+                self.assertNotIn('--progress-bar', cmd)
+                self.assertIn('--no-input', cmd)
+
+    def test_pip_install_command_includes_progress_bar_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                cmd = generator._pip_install_command(runtime, ['torch'])
+                self.assertIn('install', cmd)
+                self.assertIn('--progress-bar', cmd)
+                self.assertIn('off', cmd)
+
+    def test_repair_runtime_stack_skips_uninstall_when_no_packages_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                with patch('generator._query_torch_build', return_value={}), patch(
+                    'generator._query_installed_packages',
+                    return_value={},
+                ), patch('generator._run_subprocess_with_heartbeat') as run_mock:
+                    generator._repair_incompatible_runtime_stack(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                run_mock.assert_not_called()
+                self.assertEqual(state['repair_selected_packages'], [])
+                self.assertEqual(state['repair_skipped_reason'], 'no incompatible packages detected')
+                self.assertEqual(state['repair_detected_packages'], {})
+
+    def test_repair_runtime_stack_selective_uninstall_for_residual_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                called: list[list[str]] = []
+
+                def capture_cmd(*args: Any, **kwargs: Any) -> None:
+                    called.append(list(args[3]))
+
+                detected = {'torch-scatter': '2.1.2', 'spconv-cu120': '2.3.8'}
+                with patch('generator._query_torch_build', return_value={}), patch(
+                    'generator._query_installed_packages',
+                    return_value=detected,
+                ), patch('generator._run_subprocess_with_heartbeat', side_effect=capture_cmd):
+                    generator._repair_incompatible_runtime_stack(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                uninstall_cmd = next(cmd for cmd in called if 'uninstall' in cmd)
+                self.assertIn('torch-scatter', uninstall_cmd)
+                self.assertIn('spconv-cu120', uninstall_cmd)
+                self.assertNotIn('torch', uninstall_cmd)
+                self.assertEqual(state['repair_selected_packages'], ['spconv-cu120', 'torch-scatter'])
+
+    def test_repair_runtime_stack_log_and_state_reflect_skip_vs_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                profile = generator.get_supported_runtime_profiles()[0]
+                log_path = runtime.runtime_root / 'bootstrap.log'
+
+                skip_state = generator._default_bootstrap_state(runtime)
+                with patch('generator._query_torch_build', return_value={}), patch(
+                    'generator._query_installed_packages',
+                    return_value={},
+                ):
+                    generator._repair_incompatible_runtime_stack(runtime, skip_state, log_path, profile)
+                self.assertEqual(skip_state['repair_skipped_reason'], 'no incompatible packages detected')
+
+                repair_state = generator._default_bootstrap_state(runtime)
+                with patch('generator._query_torch_build', return_value={}), patch(
+                    'generator._query_installed_packages',
+                    return_value={'torch-scatter': '2.1.2'},
+                ), patch('generator._run_subprocess_with_heartbeat', return_value=None):
+                    generator._repair_incompatible_runtime_stack(runtime, repair_state, log_path, profile)
+                self.assertEqual(repair_state['repair_selected_packages'], ['torch-scatter'])
+                text = log_path.read_text(encoding='utf-8')
+                self.assertIn('skipped: no incompatible packages detected', text)
+                self.assertIn('selected=[\'torch-scatter\']', text)
 
     def test_validate_runtime_import_validation_is_included(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
