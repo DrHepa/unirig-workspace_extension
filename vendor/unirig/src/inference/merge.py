@@ -20,5 +20,10 @@ if __name__ == '__main__':
     args = _parse_args()
     source = Path(args.source)
     output = Path(args.output)
+    if source.suffix.lower() != '.glb':
+        raise SystemExit(
+            'Offline fallback merge only supports GLB sources; '
+            f"got '{source.suffix or '<no extension>'}' from {source}."
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, output)
