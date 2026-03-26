@@ -231,11 +231,15 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     'generator._query_runtime_info',
                     return_value={'cuda': True, 'vram_gb': 16.0},
                 ), patch(
-                    'generator._query_runtime_import_validation',
-                    return_value={'results': {'torch': 'ok', 'torch_scatter': 'ok', 'torch_cluster': 'ok', 'spconv': 'ok'}},
+                    'generator._query_required_import_validation',
+                    return_value={'results': {'torch': 'ok'}, 'missing_modules': []},
+                ), patch(
+                    'generator._validate_runpy_entrypoint',
+                    return_value={'ok': True},
                 ):
                     payload = generator._validate_runtime(runtime)
                 self.assertIn('imports', payload)
+                self.assertTrue(payload['runpy_smoke_ok'])
 
     def test_set_state_and_report_updates_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -480,7 +484,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 runtime.runtime_root.mkdir(parents=True, exist_ok=True)
                 log_path = runtime.runtime_root / 'bootstrap.log'
                 state = generator._default_bootstrap_state(runtime)
-                generator._set_state_and_report(runtime, state, None, 10, 'installing core requirements')
+                generator._set_state_and_report(runtime, state, None, 10, 'installing official UniRig requirements')
                 generator._run_subprocess_with_heartbeat(
                     runtime=runtime,
                     state=state,
@@ -488,7 +492,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     command=[sys.executable, '-c', 'import time; time.sleep(6)'],
                     cwd=runtime.runtime_root,
                     log_path=log_path,
-                    phase='installing core requirements',
+                    phase='installing official UniRig requirements',
                     timeout_sec=30,
                 )
                 saved = generator._load_bootstrap_state(runtime)
@@ -578,6 +582,81 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 saved = generator._load_bootstrap_state(runtime)
                 self.assertEqual(saved['install_state'], 'error')
                 self.assertTrue(saved.get('last_error_excerpt'))
+
+    def test_runtime_not_ready_when_lightning_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                with patch('generator._resolve_python311_command', return_value={
+                    'command': ['python3.11'],
+                    'selected_python': 'python3.11',
+                    'selected_python_version': '3.11.9',
+                    'selected_python_source': 'PATH_python',
+                    'attempts': [],
+                    'phases': [],
+                }), patch('generator._run_subprocess_with_heartbeat', return_value=None), patch(
+                    'generator._bootstrap_runtime',
+                    return_value=None,
+                ), patch(
+                    'generator._validate_runtime',
+                    side_effect=_WorkspaceToolError('UniRig runtime import validation failed. Missing modules: lightning'),
+                ):
+                    with self.assertRaises(_WorkspaceToolError):
+                        tool.install_runtime()
+                state = generator._load_bootstrap_state(runtime)
+                self.assertEqual(state['install_state'], 'error')
+                self.assertIn('Missing modules: lightning', state['last_error'])
+
+    def test_validate_runtime_fails_when_runpy_help_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                (runtime.repo_dir / 'configs' / 'task').mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / generator.SKELETON_TASK).write_text('', encoding='utf-8')
+                (runtime.repo_dir / generator.SKIN_TASK).write_text('', encoding='utf-8')
+                (runtime.repo_dir / 'src' / 'inference').mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'src' / 'inference' / 'merge.py').write_text('', encoding='utf-8')
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                with patch('generator._run_capture', return_value='{"major":3,"minor":11,"micro":9}\n'), patch(
+                    'generator._query_runtime_info',
+                    return_value={'cuda': True, 'vram_gb': 16.0},
+                ), patch(
+                    'generator._query_required_import_validation',
+                    return_value={'results': {}, 'missing_modules': []},
+                ), patch(
+                    'generator._validate_runpy_entrypoint',
+                    side_effect=_WorkspaceToolError('run.py entrypoint validation failed: ModuleNotFoundError: lightning'),
+                ):
+                    with self.assertRaises(_WorkspaceToolError):
+                        generator._validate_runtime(runtime)
+
+    def test_repair_detects_missing_required_modules_and_reinstalls_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'requirements.txt').write_text('lightning\n', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                with patch('generator._query_missing_required_modules', side_effect=[['lightning'], []]), patch(
+                    'generator._run_subprocess_with_heartbeat',
+                    return_value=None,
+                ) as run_mock:
+                    generator._repair_missing_unirig_dependencies(runtime, state, runtime.runtime_root / 'bootstrap.log')
+                run_mock.assert_called()
+                self.assertEqual(state['missing_required_modules'], [])
+
+    def test_no_custom_optional_core_dependency_split_exists(self) -> None:
+        self.assertFalse(hasattr(generator, 'DEFAULT_PYG_OPTIONAL_PACKAGES'))
+        self.assertFalse(hasattr(generator, '_split_requirements_groups'))
+        self.assertFalse(hasattr(generator, '_install_filtered_requirements'))
 
 
 if __name__ == '__main__':

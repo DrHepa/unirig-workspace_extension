@@ -32,14 +32,13 @@ PYTHON_STANDALONE_RELEASE = '20240726'
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
 DEFAULT_SPCONV_PACKAGE = 'spconv-cu120'
 DEFAULT_PYG_PACKAGES = ('torch-scatter', 'torch-cluster')
-DEFAULT_PYG_OPTIONAL_PACKAGES = ('pyg-lib', 'torch-sparse')
 DEFAULT_MIN_VRAM_GB = 8.0
 INSTALL_STATES = {'not_installed', 'installing', 'ready', 'error'}
 HEARTBEAT_INTERVAL_SEC = 5
 PHASE_TIMEOUTS_SEC = {
     'creating venv': 900,
     'installing torch': 1800,
-    'installing core requirements': 3600,
+    'installing official requirements': 3600,
     'installing spconv/PyG': 3600,
     'validating CUDA': 900,
 }
@@ -52,6 +51,25 @@ SKELETON_TASK = 'configs/task/quick_inference_skeleton_articulationxl_ar_256.yam
 SKIN_TASK = 'configs/task/quick_inference_unirig_skin.yaml'
 SKIN_DATA_NAME = 'raw_data.npz'
 MERGE_REQUIRE_SUFFIX = 'obj,fbx,FBX,dae,glb,gltf,vrm'
+REQUIRED_IMPORTS: list[tuple[str, str]] = [
+    ('lightning', 'import lightning as L'),
+    ('pytorch_lightning', 'import pytorch_lightning'),
+    ('transformers', 'import transformers'),
+    ('box', 'import box'),
+    ('einops', 'import einops'),
+    ('omegaconf', 'import omegaconf'),
+    ('timm', 'import timm'),
+    ('trimesh', 'import trimesh'),
+    ('open3d', 'import open3d'),
+    ('pyrender', 'import pyrender'),
+    ('huggingface_hub', 'import huggingface_hub'),
+    ('wandb', 'import wandb'),
+    ('bpy', 'import bpy'),
+    ('torch', 'import torch'),
+    ('torch_scatter', 'import torch_scatter'),
+    ('torch_cluster', 'import torch_cluster'),
+    ('spconv', 'import spconv'),
+]
 
 
 @dataclass(frozen=True)
@@ -220,13 +238,17 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 state,
                 progress_cb,
                 92,
-                'validating CUDA',
+                'validating required imports',
                 phase_timeout_sec=PHASE_TIMEOUTS_SEC['validating CUDA'],
                 phase_started_at=int(time.time()),
             )
-            validation = _validate_runtime(runtime)
+            validation = _validate_runtime(runtime, bootstrap_log=bootstrap_log)
             _complete_phase(state, 'validate_cuda')
             _append_install_phase(state, 'validate', 'ok')
+            state['missing_required_modules'] = validation.get('missing_required_modules', [])
+            state['runpy_smoke_ok'] = bool(validation.get('runpy_smoke_ok'))
+            state['required_baseline_installed'] = bool(validation.get('baseline_installed'))
+            state['last_validation_error'] = ''
             _write_bootstrap_state(runtime, state)
 
             _set_state_and_report(
@@ -249,6 +271,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _log_bootstrap_event(bootstrap_log, 'install_runtime', 'ok', 'runtime ready')
             return state
         except Exception as exc:
+            state['last_validation_error'] = str(exc)
             if not state.get('last_error_excerpt') and state.get('bootstrap_log'):
                 state['last_error_excerpt'] = _tail_text(Path(str(state['bootstrap_log'])), 80)
             _set_state_and_report(
@@ -669,6 +692,11 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'selected_torch_index_url': '',
         'binary_only_mode': True,
         'source_build_allowed': _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False),
+        'required_baseline_source': '',
+        'required_baseline_installed': False,
+        'missing_required_modules': [],
+        'runpy_smoke_ok': False,
+        'last_validation_error': '',
         'install_phases': [],
         'completed_phases': [],
     }
@@ -1301,7 +1329,7 @@ def _bootstrap_runtime(
             cwd=runtime.repo_dir,
             log_path=bootstrap_log,
             phase='updating pip tooling',
-            timeout_sec=PHASE_TIMEOUTS_SEC['installing core requirements'],
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
         )
         _mark_phase(runtime, 'upgrade_pip')
         _complete_phase(state, 'upgrade_pip')
@@ -1309,12 +1337,12 @@ def _bootstrap_runtime(
         phase_cb(68, 'installing torch')
     _install_torch(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     if phase_cb:
-        phase_cb(76, 'installing core requirements')
-    _install_filtered_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
-    _validate_core_pipeline_imports(runtime, state, bootstrap_log, progress_cb=progress_cb)
+        phase_cb(76, 'installing official UniRig requirements')
+    _install_official_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
     if phase_cb:
         phase_cb(84, 'installing spconv/PyG')
     _install_spconv_and_pyg(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
+    _repair_missing_unirig_dependencies(runtime, state, bootstrap_log, progress_cb=progress_cb)
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'ok')
 
 
@@ -1469,144 +1497,23 @@ def _install_torch(
     _complete_phase(state, 'install_torch')
 
 
-def _install_filtered_requirements(
+def _install_official_requirements(
     runtime: RuntimeContext,
     state: dict,
     log_path: Path,
+    force: bool = False,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> None:
     requirements_path = runtime.repo_dir / 'requirements.txt'
     if not requirements_path.exists():
         raise WorkspaceToolError(f'UniRig requirements.txt not found: {requirements_path}')
-
-    filtered_text = _filtered_requirements_text(requirements_path.read_text(encoding='utf-8'))
-    filtered_path = runtime.runtime_root / 'requirements.filtered.txt'
-    filtered_path.write_text(filtered_text, encoding='utf-8')
-    grouped = _split_requirements_groups(filtered_text)
-    (runtime.runtime_root / 'requirements.core.txt').write_text('\n'.join(grouped['core_python_libs']).rstrip() + '\n', encoding='utf-8')
-    (runtime.runtime_root / 'requirements.hf.txt').write_text('\n'.join(grouped['huggingface_transformers']).rstrip() + '\n', encoding='utf-8')
-    (runtime.runtime_root / 'requirements.geometry.txt').write_text('\n'.join(grouped['geometry_runtime_libs']).rstrip() + '\n', encoding='utf-8')
-    (runtime.runtime_root / 'requirements.optional.txt').write_text('\n'.join(grouped['optional_extras']).rstrip() + '\n', encoding='utf-8')
-    phase_map = [
-        ('core_python_libs', 'installing core requirements'),
-        ('huggingface_transformers', 'installing huggingface/transformers'),
-        ('geometry_runtime_libs', 'installing geometry/runtime libs'),
-    ]
-    for phase_key, phase_name in phase_map:
-        lines = grouped[phase_key]
-        if not lines:
-            _mark_phase(runtime, phase_key)
-            _complete_phase(state, phase_key)
-            continue
-        if _phase_marked(runtime, phase_key):
-            _complete_phase(state, phase_key)
-            continue
-        tmp_path = runtime.runtime_root / f'requirements.{phase_key}.txt'
-        tmp_path.write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8')
-        _run_subprocess_with_heartbeat(
-            runtime,
-            state,
-            progress_cb,
-            _pip_install_command(runtime, ['-r', str(tmp_path)]),
-            cwd=runtime.repo_dir,
-            log_path=log_path,
-            phase=phase_name,
-            timeout_sec=PHASE_TIMEOUTS_SEC['installing core requirements'],
-        )
-        _mark_phase(runtime, phase_key)
-        _complete_phase(state, phase_key)
-
-    if grouped['optional_extras'] and not _phase_marked(runtime, 'optional_extras'):
-        _log_bootstrap_event(
-            log_path,
-            'installing optional extras',
-            'ok',
-            f"skipped by default ({', '.join(sorted(_base_requirement_name(line) for line in grouped['optional_extras']))})",
-        )
-        _mark_phase(runtime, 'optional_extras')
-        _complete_phase(state, 'optional_extras')
-
-
-def _filtered_requirements_text(raw_text: str) -> str:
-    keep_flash_attn = _env_truthy('MODLY_UNIRIG_ENABLE_FLASH_ATTN', False)
-    out_lines: list[str] = []
-    for line in raw_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            out_lines.append(line)
-            continue
-        package_name = _base_requirement_name(stripped)
-        if not keep_flash_attn and package_name in {'flash_attn', 'flash-attn'}:
-            continue
-        out_lines.append(line)
-    return '\n'.join(out_lines).rstrip() + '\n'
-
-
-def _base_requirement_name(requirement_line: str) -> str:
-    cleaned = requirement_line.split(';', 1)[0].strip()
-    for token in ('==', '>=', '<=', '~=', '!=', '>', '<'):
-        if token in cleaned:
-            cleaned = cleaned.split(token, 1)[0].strip()
-            break
-    if '[' in cleaned:
-        cleaned = cleaned.split('[', 1)[0].strip()
-    return cleaned.replace('_', '-').lower()
-
-
-def _split_requirements_groups(raw_text: str) -> dict[str, list[str]]:
-    huggingface = {'transformers', 'huggingface-hub', 'tokenizers', 'safetensors', 'accelerate', 'sentencepiece', 'timm'}
-    geometry = {'trimesh', 'open3d', 'pymeshlab', 'pygltflib', 'rtree', 'xatlas', 'scikit-image', 'opencv-python', 'opencv-python-headless'}
-    optional = {
-        'pytorch-lightning',
-        'lightning',
-        'wandb',
-        'dash',
-        'ipywidgets',
-        'flask',
-        'open3d',
-        'bpy',
-        'torch-sparse',
-        'pyg-lib',
-    }
-    groups = {
-        'core_python_libs': [],
-        'huggingface_transformers': [],
-        'geometry_runtime_libs': [],
-        'optional_extras': [],
-    }
-    for line in raw_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        pkg = _base_requirement_name(stripped)
-        if pkg in optional:
-            groups['optional_extras'].append(stripped)
-        elif pkg in huggingface:
-            groups['huggingface_transformers'].append(stripped)
-        elif pkg in geometry:
-            groups['geometry_runtime_libs'].append(stripped)
-        else:
-            groups['core_python_libs'].append(stripped)
-    return groups
-
-
-def _validate_core_pipeline_imports(
-    runtime: RuntimeContext,
-    state: dict,
-    log_path: Path,
-    progress_cb: Optional[Callable[[int, str], None]] = None,
-) -> None:
-    if _phase_marked(runtime, 'validate_core_imports'):
-        _complete_phase(state, 'validate_core_imports')
+    state['required_baseline_source'] = str(requirements_path)
+    if _phase_marked(runtime, 'official_requirements') and not force:
+        _complete_phase(state, 'official_requirements')
+        _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(log_path, 'installing official UniRig requirements', 'ok', 'skipped: marker exists')
         return
-    command = [
-        str(runtime.python_exe),
-        '-c',
-        'import importlib; '
-        "mods=['torch','numpy','scipy','trimesh']; "
-        '[importlib.import_module(m) for m in mods]; '
-        "print('core imports ok')",
-    ]
+    command = _pip_install_command(runtime, ['-r', str(requirements_path)])
     _run_subprocess_with_heartbeat(
         runtime,
         state,
@@ -1614,11 +1521,13 @@ def _validate_core_pipeline_imports(
         command,
         cwd=runtime.repo_dir,
         log_path=log_path,
-        phase='validating core imports',
-        timeout_sec=PHASE_TIMEOUTS_SEC['validating CUDA'],
+        phase='installing official UniRig requirements',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
     )
-    _mark_phase(runtime, 'validate_core_imports')
-    _complete_phase(state, 'validate_core_imports')
+    _mark_phase(runtime, 'official_requirements')
+    _complete_phase(state, 'official_requirements')
+    state['required_baseline_installed'] = True
+    _write_bootstrap_state(runtime, state)
 
 
 def _install_spconv_and_pyg(
@@ -1670,6 +1579,35 @@ def _install_spconv_and_pyg(
         raise
     _mark_phase(runtime, 'spconv_pyg')
     _complete_phase(state, 'spconv_pyg')
+
+
+def _repair_missing_unirig_dependencies(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    missing = _query_missing_required_modules(runtime)
+    state['missing_required_modules'] = missing
+    _write_bootstrap_state(runtime, state)
+    if not missing:
+        _log_bootstrap_event(log_path, 'repairing missing UniRig dependencies', 'ok', 'no missing required modules')
+        return
+    _log_bootstrap_event(
+        log_path,
+        'repairing missing UniRig dependencies',
+        'start',
+        f"missing modules detected: {', '.join(missing)}",
+    )
+    _install_official_requirements(runtime, state, log_path, force=True, progress_cb=progress_cb)
+    missing_after = _query_missing_required_modules(runtime)
+    state['missing_required_modules'] = missing_after
+    _write_bootstrap_state(runtime, state)
+    if missing_after:
+        raise WorkspaceToolError(
+            'Missing required UniRig modules after repair: ' + ', '.join(missing_after)
+        )
+    _log_bootstrap_event(log_path, 'repairing missing UniRig dependencies', 'ok', 'required modules repaired')
 
 
 def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
@@ -1733,7 +1671,7 @@ def _query_torch_build(runtime: RuntimeContext) -> dict:
     return _parse_last_json_line(output, 'Failed to query torch build information')
 
 
-def _validate_runtime(runtime: RuntimeContext) -> dict:
+def _validate_runtime(runtime: RuntimeContext, bootstrap_log: Path | None = None) -> dict:
     version_script = (
         'import json, sys; '
         "print(json.dumps({'major': sys.version_info.major, 'minor': sys.version_info.minor, 'micro': sys.version_info.micro}))"
@@ -1751,7 +1689,15 @@ def _validate_runtime(runtime: RuntimeContext) -> dict:
         )
 
     runtime_info = _query_runtime_info(runtime)
-    import_validation = _query_runtime_import_validation(runtime)
+    if bootstrap_log:
+        _log_bootstrap_event(bootstrap_log, 'validating required imports', 'start')
+    import_validation = _query_required_import_validation(runtime)
+    if bootstrap_log:
+        _log_bootstrap_event(bootstrap_log, 'validating required imports', 'ok', f"validated modules={len(REQUIRED_IMPORTS)}")
+        _log_bootstrap_event(bootstrap_log, 'validating run.py entrypoint', 'start')
+    runpy_smoke = _validate_runpy_entrypoint(runtime)
+    if bootstrap_log:
+        _log_bootstrap_event(bootstrap_log, 'validating run.py entrypoint', 'ok')
     if _env_truthy('MODLY_UNIRIG_ENFORCE_GPU', True):
         if not runtime_info.get('cuda'):
             raise WorkspaceToolError(
@@ -1774,7 +1720,14 @@ def _validate_runtime(runtime: RuntimeContext) -> dict:
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
         raise WorkspaceToolError(f'UniRig runtime is incomplete. Missing files: {missing}')
-    return {'python': version_info, 'gpu': runtime_info, 'imports': import_validation}
+    return {
+        'python': version_info,
+        'gpu': runtime_info,
+        'imports': import_validation,
+        'runpy_smoke_ok': runpy_smoke['ok'],
+        'missing_required_modules': import_validation.get('missing_modules', []),
+        'baseline_installed': not bool(import_validation.get('missing_modules')),
+    }
 
 
 def _query_runtime_info(runtime: RuntimeContext) -> dict:
@@ -1793,26 +1746,45 @@ def _query_runtime_info(runtime: RuntimeContext) -> dict:
     return _parse_last_json_line(output, 'Failed to query UniRig GPU runtime information')
 
 
-def _query_runtime_import_validation(runtime: RuntimeContext) -> dict:
+def _query_missing_required_modules(runtime: RuntimeContext) -> list[str]:
+    validation = _query_required_import_validation(runtime, raise_on_missing=False)
+    missing = validation.get('missing_modules', [])
+    return missing if isinstance(missing, list) else []
+
+
+def _query_required_import_validation(runtime: RuntimeContext, raise_on_missing: bool = True) -> dict:
+    requirements = [{'module': module_name, 'statement': statement} for module_name, statement in REQUIRED_IMPORTS]
     script = (
-        'import importlib, json, torch; '
-        "mods = ['torch', 'torch_scatter', 'torch_cluster', 'spconv']; "
-        "results = {}; "
-        '\nfor mod in mods:\n'
+        'import importlib, json; '
+        f'requirements={requirements!r}; '
+        'results = {}; '
+        'missing = []; '
+        '\nfor item in requirements:\n'
+        "    mod = item['module']\n"
         '    try:\n'
         '        importlib.import_module(mod)\n'
         "        results[mod] = 'ok'\n"
         '    except Exception as exc:\n'
         "        results[mod] = f'error: {exc}'\n"
-        "payload = {'results': results, 'torch_version': torch.__version__, 'torch_cuda_version': torch.version.cuda, 'cuda_available': bool(torch.cuda.is_available())}; "
+        '        missing.append(mod)\n'
+        "payload = {'results': results, 'missing_modules': missing}; "
         'print(json.dumps(payload))'
     )
     output = _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir)
-    payload = _parse_last_json_line(output, 'Failed to validate installed torch/PyG imports')
-    failed = {k: v for k, v in payload.get('results', {}).items() if v != 'ok'}
-    if failed:
-        raise WorkspaceToolError(f'UniRig runtime import validation failed: {failed}')
+    payload = _parse_last_json_line(output, 'Failed to validate required UniRig imports')
+    missing = payload.get('missing_modules', [])
+    if raise_on_missing and missing:
+        raise WorkspaceToolError(f"UniRig runtime import validation failed. Missing modules: {', '.join(missing)}")
     return payload
+
+
+def _validate_runpy_entrypoint(runtime: RuntimeContext) -> dict:
+    command = [str(runtime.python_exe), 'run.py', '--help']
+    try:
+        output = _run_capture(command, cwd=runtime.repo_dir)
+        return {'ok': True, 'output_excerpt': '\n'.join(output.splitlines()[:20])}
+    except Exception as exc:
+        raise WorkspaceToolError(f'run.py entrypoint validation failed: {exc}') from exc
 
 
 def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
@@ -1949,7 +1921,6 @@ __all__ = [
     'UniRigWorkspaceTool',
     'UniRigStageCommands',
     'build_unirig_commands',
-    '_filtered_requirements_text',
     '_prepare_input_mesh',
     '_default_bootstrap_state',
     '_normalize_state',
