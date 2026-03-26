@@ -1,0 +1,2 @@
+class Box(dict):
+    pass

@@ -67,7 +67,6 @@ class RuntimeContext:
     logs_dir: Path
     extension_root: Path
     extension_vendor_dir: Path
-    runtime_vendor_dir: Path
     active_vendor_dir: Path
     unirig_dir: Path
 
@@ -322,8 +321,7 @@ def _resolve_runtime_context() -> RuntimeContext:
     venv_dir = runtime_root / 'venv'
     python_exe = venv_dir / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     logs_dir = runtime_root / 'logs'
-    runtime_vendor_dir = runtime_root / 'vendor'
-    active_vendor_dir, unirig_dir = _resolve_active_vendor_dirs(extension_vendor_dir, runtime_vendor_dir)
+    active_vendor_dir, unirig_dir = _resolve_active_vendor_dirs(extension_vendor_dir)
     return RuntimeContext(
         runtime_root=runtime_root,
         venv_dir=venv_dir,
@@ -331,16 +329,14 @@ def _resolve_runtime_context() -> RuntimeContext:
         logs_dir=logs_dir,
         extension_root=extension_root,
         extension_vendor_dir=extension_vendor_dir,
-        runtime_vendor_dir=runtime_vendor_dir,
         active_vendor_dir=active_vendor_dir,
         unirig_dir=unirig_dir,
     )
 
 
-def _resolve_active_vendor_dirs(extension_vendor_dir: Path, runtime_vendor_dir: Path) -> tuple[Path, Path]:
-    for base in (extension_vendor_dir, runtime_vendor_dir):
-        if _validate_vendor_dir(base):
-            return base, base / 'unirig'
+def _resolve_active_vendor_dirs(extension_vendor_dir: Path) -> tuple[Path, Path]:
+    if _validate_vendor_dir(extension_vendor_dir):
+        return extension_vendor_dir, extension_vendor_dir / 'unirig'
     return extension_vendor_dir, extension_vendor_dir / 'unirig'
 
 
@@ -356,17 +352,12 @@ def _ensure_vendor(runtime: RuntimeContext, progress_cb: Optional[Callable[[int,
     if _validate_vendor_dir(runtime.extension_vendor_dir):
         runtime.active_vendor_dir = runtime.extension_vendor_dir
         runtime.unirig_dir = runtime.active_vendor_dir / 'unirig'
-    elif _validate_vendor_dir(runtime.runtime_vendor_dir):
-        runtime.active_vendor_dir = runtime.runtime_vendor_dir
-        runtime.unirig_dir = runtime.active_vendor_dir / 'unirig'
     else:
-        _report(progress_cb, 28, 'building vendor cache')
-        _build_vendor_into_runtime(runtime)
-        if not _validate_vendor_dir(runtime.runtime_vendor_dir):
-            required = ', '.join(str(p) for p in _required_vendor_paths(runtime.runtime_vendor_dir))
-            raise WorkspaceToolError(f'Runtime vendor build succeeded but vendor is incomplete. Required: {required}')
-        runtime.active_vendor_dir = runtime.runtime_vendor_dir
-        runtime.unirig_dir = runtime.active_vendor_dir / 'unirig'
+        required = ', '.join(str(p) for p in _required_vendor_paths(runtime.extension_vendor_dir))
+        raise WorkspaceToolError(
+            'Missing vendored UniRig sources. Run build_vendor.py in the extension root to populate vendor/. '
+            f'Required: {required}'
+        )
 
     vendor_str = str(runtime.active_vendor_dir)
     unirig_str = str(runtime.unirig_dir)
@@ -374,25 +365,6 @@ def _ensure_vendor(runtime: RuntimeContext, progress_cb: Optional[Callable[[int,
         sys_path_list().insert(0, vendor_str)
     if unirig_str not in sys_path_list():
         sys_path_list().insert(0, unirig_str)
-
-
-def _build_vendor_into_runtime(runtime: RuntimeContext) -> None:
-    build_script = runtime.extension_root / 'build_vendor.py'
-    if not build_script.exists():
-        raise WorkspaceToolError(f'build_vendor.py missing at {build_script}')
-    build_python = runtime.python_exe if runtime.python_exe.exists() else Path(sys.executable)
-    env = os.environ.copy()
-    env['MODLY_UNIRIG_VENDOR_DIR'] = str(runtime.runtime_vendor_dir)
-    result = subprocess.run(
-        [str(build_python), str(build_script), '--dest', str(runtime.runtime_vendor_dir)],
-        cwd=str(runtime.extension_root),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or '').strip()
-        raise WorkspaceToolError(f'Automatic vendor build failed. See logs for details.\n{detail}')
 
 
 def sys_path_list() -> list[str]:
@@ -415,9 +387,7 @@ def _ensure_windows_binary_path() -> None:
 
 
 def _runtime_ready(runtime: RuntimeContext) -> bool:
-    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(
-        runtime.extension_vendor_dir, runtime.runtime_vendor_dir
-    )
+    runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime.extension_vendor_dir)
     state = _load_state(runtime)
     return state.get('install_state') == 'ready' and runtime.python_exe.exists() and (runtime.unirig_dir / 'run.py').exists()
 
