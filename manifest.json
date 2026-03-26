@@ -2,7 +2,7 @@
   "id": "unirig-workspace-v1",
   "name": "UniRig Workspace Tool",
   "description": "Vendored UniRig workspace tool using pinned vendor/ source and runtime wheel installs only.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": "DrHepa",
   "extension_type": "workspace_tool",
   "workspace_tool_class": "UniRigWorkspaceTool",
