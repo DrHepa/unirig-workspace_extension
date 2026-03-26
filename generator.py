@@ -1152,6 +1152,12 @@ def _phase_marked(runtime: RuntimeContext, phase: str) -> bool:
     return _marker_path(runtime, phase).exists()
 
 
+def _clear_phase_marker(runtime: RuntimeContext, phase: str) -> None:
+    marker = _marker_path(runtime, phase)
+    if marker.exists():
+        marker.unlink()
+
+
 def _is_venv_valid(runtime: RuntimeContext) -> bool:
     if not runtime.python_exe.exists():
         return False
@@ -1371,6 +1377,7 @@ def _repair_incompatible_runtime_stack(
         phase='repairing incompatible torch/PyG stack',
         timeout_sec=PHASE_TIMEOUTS_SEC['installing torch'],
     )
+    _clear_phase_marker(runtime, 'spconv_pyg')
     _log_bootstrap_event(log_path, 'repair runtime stack', 'ok', 'partial cleanup completed')
 
 

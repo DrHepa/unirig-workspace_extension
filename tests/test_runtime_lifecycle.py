@@ -102,6 +102,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 runtime.python_exe.write_text('', encoding='utf-8')
                 state = generator._default_bootstrap_state(runtime)
                 profile = generator.get_supported_runtime_profiles()[0]
+                generator._mark_phase(runtime, 'spconv_pyg')
                 called: list[list[str]] = []
 
                 def capture_cmd(*args: Any, **kwargs: Any) -> None:
@@ -113,6 +114,26 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 ):
                     generator._repair_incompatible_runtime_stack(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
                 self.assertTrue(any('uninstall' in cmd for cmd in called))
+                self.assertFalse((runtime.runtime_root / '.markers' / 'spconv_pyg.done').exists())
+
+    def test_repair_runtime_stack_clears_stale_spconv_marker_on_partial_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                generator._mark_phase(runtime, 'spconv_pyg')
+
+                with patch('generator._query_torch_build', return_value={'version': '2.11.0+cpu'}), patch(
+                    'generator._run_subprocess_with_heartbeat',
+                    return_value=None,
+                ):
+                    generator._repair_incompatible_runtime_stack(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+
+                self.assertFalse(generator._phase_marked(runtime, 'spconv_pyg'))
 
     def test_validate_runtime_import_validation_is_included(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
