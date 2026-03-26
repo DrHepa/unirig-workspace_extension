@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import os
 import platform
+import queue
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -30,6 +33,14 @@ DEFAULT_SPCONV_PACKAGE = 'spconv-cu120'
 DEFAULT_PYG_PACKAGES = ('torch-scatter', 'torch-cluster')
 DEFAULT_MIN_VRAM_GB = 8.0
 INSTALL_STATES = {'not_installed', 'installing', 'ready', 'error'}
+HEARTBEAT_INTERVAL_SEC = 5
+PHASE_TIMEOUTS_SEC = {
+    'creating venv': 900,
+    'installing torch': 1800,
+    'installing core requirements': 3600,
+    'installing spconv/PyG': 3600,
+    'validating CUDA': 900,
+}
 
 DIRECT_INPUT_SUFFIXES = {'.obj', '.fbx', '.glb', '.vrm'}
 CONVERTIBLE_INPUT_SUFFIXES = {'.gltf', '.stl', '.ply'}
@@ -101,6 +112,9 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 shutil.rmtree(runtime.venv_dir, ignore_errors=True)
             if runtime.repo_dir.exists() and not runtime.external_repo:
                 shutil.rmtree(runtime.repo_dir, ignore_errors=True)
+            markers = runtime.runtime_root / '.markers'
+            if markers.exists():
+                shutil.rmtree(markers, ignore_errors=True)
 
         state = _default_bootstrap_state(runtime)
         state.update(
@@ -140,34 +154,61 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             )
 
             _set_state_and_report(runtime, state, progress_cb, 35, 'preparing UniRig repo')
-            self._prepare_repo(
-                runtime,
-                bootstrap_log=bootstrap_log,
-                heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb),
-                phase_cb=lambda percent, step: _set_state_and_report(runtime, state, progress_cb, percent, step),
-            )
+            if not _phase_marked(runtime, 'prepare_repo'):
+                self._prepare_repo(
+                    runtime,
+                    bootstrap_log=bootstrap_log,
+                    heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb),
+                    phase_cb=lambda percent, step: _set_state_and_report(runtime, state, progress_cb, percent, step),
+                )
+                _mark_phase(runtime, 'prepare_repo')
+            _complete_phase(state, 'prepare_repo')
             _append_install_phase(state, 'prepare_repo', 'ok')
             _write_bootstrap_state(runtime, state)
 
             _set_state_and_report(runtime, state, progress_cb, 55, 'creating venv')
-            _log_bootstrap_event(bootstrap_log, 'creating venv', 'start', _format_command([*python_cmd, '-m', 'venv', str(runtime.venv_dir)]))
-            _create_venv(runtime, python_cmd, heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb))
-            _log_bootstrap_event(bootstrap_log, 'creating venv', 'ok')
+            if _phase_marked(runtime, 'create_venv') and _is_venv_valid(runtime):
+                _log_bootstrap_event(bootstrap_log, 'creating venv', 'ok', 'skipped: existing venv is valid')
+            else:
+                _run_subprocess_with_heartbeat(
+                    runtime,
+                    state,
+                    progress_cb,
+                    [*python_cmd, '-m', 'venv', str(runtime.venv_dir)],
+                    cwd=runtime.runtime_root,
+                    log_path=bootstrap_log,
+                    phase='creating venv',
+                    timeout_sec=PHASE_TIMEOUTS_SEC['creating venv'],
+                )
+                if not runtime.python_exe.exists():
+                    raise WorkspaceToolError(f'Venv creation succeeded but Python executable was not found: {runtime.python_exe}')
+                _mark_phase(runtime, 'create_venv')
+            _complete_phase(state, 'create_venv')
             _append_install_phase(state, 'create_venv', 'ok')
             _write_bootstrap_state(runtime, state)
 
             _set_state_and_report(runtime, state, progress_cb, 65, 'installing torch')
             _bootstrap_runtime(
                 runtime,
+                state,
                 bootstrap_log,
+                progress_cb=progress_cb,
                 phase_cb=lambda percent, step: _set_state_and_report(runtime, state, progress_cb, percent, step),
-                heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb),
             )
             _append_install_phase(state, 'bootstrap_runtime', 'ok')
             _write_bootstrap_state(runtime, state)
 
-            _set_state_and_report(runtime, state, progress_cb, 92, 'validating CUDA')
+            _set_state_and_report(
+                runtime,
+                state,
+                progress_cb,
+                92,
+                'validating CUDA',
+                phase_timeout_sec=PHASE_TIMEOUTS_SEC['validating CUDA'],
+                phase_started_at=int(time.time()),
+            )
             validation = _validate_runtime(runtime)
+            _complete_phase(state, 'validate_cuda')
             _append_install_phase(state, 'validate', 'ok')
             _write_bootstrap_state(runtime, state)
 
@@ -180,6 +221,9 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 install_state='ready',
                 completed_at=int(time.time()),
                 last_error='',
+                subprocess_alive=False,
+                subprocess_pid=None,
+                subprocess_cmd='',
                 python_exe=str(runtime.python_exe),
             )
             state['validation'] = validation
@@ -188,6 +232,8 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _log_bootstrap_event(bootstrap_log, 'install_runtime', 'ok', 'runtime ready')
             return state
         except Exception as exc:
+            if not state.get('last_error_excerpt') and state.get('bootstrap_log'):
+                state['last_error_excerpt'] = _tail_text(Path(str(state['bootstrap_log'])), 80)
             _set_state_and_report(
                 runtime,
                 state,
@@ -197,6 +243,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 install_state='error',
                 completed_at=int(time.time()),
                 last_error=str(exc),
+                subprocess_alive=False,
             )
             _append_install_phase(state, state.get('step', 'failed'), 'error', str(exc))
             _write_bootstrap_state(runtime, state)
@@ -484,6 +531,13 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'completed_at': None,
         'updated_at': now,
         'last_heartbeat_at': now,
+        'phase_started_at': None,
+        'last_output_at': None,
+        'subprocess_pid': None,
+        'subprocess_cmd': '',
+        'subprocess_alive': False,
+        'phase_timeout_sec': None,
+        'last_error_excerpt': '',
         'bootstrap_log': '',
         'python_exe': str(runtime.python_exe),
         'repo_dir': str(runtime.repo_dir),
@@ -495,6 +549,7 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'python_lookup_attempts': [],
         'standalone_python_root': '',
         'install_phases': [],
+        'completed_phases': [],
     }
 
 
@@ -538,6 +593,7 @@ def _set_state_and_report(
 ) -> None:
     now = int(time.time())
     message = updates.pop('message', step)
+    phase_started_at = updates.pop('phase_started_at', state.get('phase_started_at'))
     state.update(
         {
             'percent': percent,
@@ -545,6 +601,7 @@ def _set_state_and_report(
             'message': message,
             'updated_at': now,
             'last_heartbeat_at': now,
+            'phase_started_at': phase_started_at if phase_started_at is not None else now,
             **updates,
         }
     )
@@ -558,14 +615,21 @@ def _heartbeat_state(
     state: dict,
     progress_cb: Optional[Callable[[int, str], None]],
 ) -> None:
-    _set_state_and_report(
-        runtime,
-        state,
-        progress_cb,
-        int(state.get('percent', 0)),
-        str(state.get('step', 'installing')),
-        message=state.get('message') or state.get('step', 'installing'),
+    now = int(time.time())
+    state.update(
+        {
+            'updated_at': now,
+            'last_heartbeat_at': now,
+            'message': state.get('message') or state.get('step', 'installing'),
+        }
     )
+    _write_bootstrap_state(runtime, state)
+
+
+def _complete_phase(state: dict, phase_name: str) -> None:
+    completed = state.setdefault('completed_phases', [])
+    if isinstance(completed, list) and phase_name not in completed:
+        completed.append(phase_name)
 
 
 def _append_install_phase(state: dict, phase: str, status: str, detail: str = '') -> None:
@@ -952,67 +1016,210 @@ def _extract_archive(archive: Path, destination: Path, heartbeat_cb: Optional[Ca
                 heartbeat_cb()
 
 
-def _create_venv(runtime: RuntimeContext, python311_command: list[str], heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
-    if runtime.venv_dir.exists():
-        shutil.rmtree(runtime.venv_dir, ignore_errors=True)
-    runtime.venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [*python311_command, '-m', 'venv', str(runtime.venv_dir)],
-        capture_output=True,
-        text=True,
-    )
-    if heartbeat_cb:
-        heartbeat_cb()
-    if result.returncode != 0:
-        tail = '\n'.join((result.stderr or result.stdout).splitlines()[-40:])
-        raise WorkspaceToolError(f'Failed to create the isolated UniRig venv. Last output:\n{tail}')
+def _marker_path(runtime: RuntimeContext, phase: str) -> Path:
+    safe = phase.replace(' ', '_').replace('/', '_')
+    return runtime.runtime_root / '.markers' / f'{safe}.done'
+
+
+def _mark_phase(runtime: RuntimeContext, phase: str) -> None:
+    marker = _marker_path(runtime, phase)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(int(time.time())), encoding='utf-8')
+
+
+def _phase_marked(runtime: RuntimeContext, phase: str) -> bool:
+    return _marker_path(runtime, phase).exists()
+
+
+def _is_venv_valid(runtime: RuntimeContext) -> bool:
     if not runtime.python_exe.exists():
-        raise WorkspaceToolError(f'Venv creation succeeded but Python executable was not found: {runtime.python_exe}')
+        return False
+    try:
+        _run_capture([str(runtime.python_exe), '-c', 'import sys; print(sys.executable)'], cwd=runtime.runtime_root)
+        return True
+    except Exception:
+        return False
+
+
+def _run_subprocess_with_heartbeat(
+    runtime: RuntimeContext,
+    state: dict,
+    progress_cb: Optional[Callable[[int, str], None]],
+    command: Sequence[str],
+    cwd: Path,
+    log_path: Path,
+    phase: str,
+    timeout_sec: int,
+    env: dict | None = None,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    recent_lines: deque[str] = deque(maxlen=100)
+    now = int(time.time())
+    state.update(
+        {
+            'phase_started_at': now,
+            'last_output_at': now,
+            'phase_timeout_sec': timeout_sec,
+            'subprocess_cmd': _format_command(command),
+            'subprocess_pid': None,
+            'subprocess_alive': True,
+            'last_error_excerpt': '',
+        }
+    )
+    _write_bootstrap_state(runtime, state)
+    _log_bootstrap_event(log_path, phase, 'start', _format_command(command))
+
+    with log_path.open('a', encoding='utf-8') as log_file:
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        state['subprocess_pid'] = process.pid
+        _write_bootstrap_state(runtime, state)
+
+        out_queue: queue.Queue[str | None] = queue.Queue()
+
+        def _reader() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                out_queue.put(line)
+            out_queue.put(None)
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        last_heartbeat = time.time()
+        phase_started = time.time()
+        stream_closed = False
+
+        while True:
+            try:
+                item = out_queue.get(timeout=1.0)
+            except queue.Empty:
+                item = '__NO_LINE__'
+
+            if item is None:
+                stream_closed = True
+            elif item != '__NO_LINE__':
+                line = item.rstrip('\n')
+                recent_lines.append(line)
+                log_file.write(item)
+                log_file.flush()
+                state['last_output_at'] = int(time.time())
+                _write_bootstrap_state(runtime, state)
+
+            if process.poll() is None and (time.time() - last_heartbeat) >= HEARTBEAT_INTERVAL_SEC:
+                _heartbeat_state(runtime, state, progress_cb)
+                _log_bootstrap_event(log_path, phase, 'heartbeat', f'pid={process.pid}')
+                last_heartbeat = time.time()
+
+            if process.poll() is None and (time.time() - phase_started) > timeout_sec:
+                process.terminate()
+                excerpt = '\n'.join(recent_lines) or '(no output captured)'
+                state.update({'last_error_excerpt': excerpt, 'subprocess_alive': False})
+                _write_bootstrap_state(runtime, state)
+                _log_bootstrap_event(log_path, phase, 'error', f'timeout after {timeout_sec}s')
+                raise WorkspaceToolError(f'Phase timeout ({phase}, {timeout_sec}s). Last output:\n{excerpt}')
+
+            if process.poll() is not None and stream_closed:
+                break
+
+        rc = process.wait()
+        if process.stdout:
+            process.stdout.close()
+        state['subprocess_alive'] = False
+        _write_bootstrap_state(runtime, state)
+        if rc == 0:
+            _log_bootstrap_event(log_path, phase, 'ok')
+            return
+        excerpt = '\n'.join(recent_lines) or '(no output captured)'
+        state['last_error_excerpt'] = excerpt
+        _write_bootstrap_state(runtime, state)
+        _log_bootstrap_event(log_path, phase, 'error', f'exit={rc}')
+        raise WorkspaceToolError(f'Command failed ({phase}, exit={rc}). Last output:\n{excerpt}')
 
 
 def _bootstrap_runtime(
     runtime: RuntimeContext,
+    state: dict,
     bootstrap_log: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
     phase_cb: Optional[Callable[[int, str], None]] = None,
-    heartbeat_cb: Optional[Callable[[], None]] = None,
 ) -> None:
-    _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'start')
-    _run_logged(
-        _pip_install_command(runtime, ['--upgrade', 'pip', 'setuptools', 'wheel']),
-        cwd=runtime.repo_dir,
-        log_path=bootstrap_log,
-        phase='bootstrap deps',
-        heartbeat_cb=heartbeat_cb,
-    )
+    _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'start', 'resumable phases enabled')
+    if not _phase_marked(runtime, 'upgrade_pip'):
+        _run_subprocess_with_heartbeat(
+            runtime,
+            state,
+            progress_cb,
+            _pip_install_command(runtime, ['--upgrade', 'pip', 'setuptools', 'wheel']),
+            cwd=runtime.repo_dir,
+            log_path=bootstrap_log,
+            phase='updating pip tooling',
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing core requirements'],
+        )
+        _mark_phase(runtime, 'upgrade_pip')
+        _complete_phase(state, 'upgrade_pip')
     if phase_cb:
         phase_cb(68, 'installing torch')
-    _install_torch(runtime, bootstrap_log, heartbeat_cb=heartbeat_cb)
+    _install_torch(runtime, state, bootstrap_log, progress_cb=progress_cb)
     if phase_cb:
-        phase_cb(76, 'installing UniRig requirements')
-    _install_filtered_requirements(runtime, bootstrap_log, heartbeat_cb=heartbeat_cb)
-    _run_logged(
-        _pip_install_command(runtime, ['numpy==1.26.4', 'scipy']),
-        cwd=runtime.repo_dir,
-        log_path=bootstrap_log,
-        phase='installing UniRig requirements',
-        heartbeat_cb=heartbeat_cb,
-    )
+        phase_cb(76, 'installing core requirements')
+    _install_filtered_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
+    _validate_core_pipeline_imports(runtime, state, bootstrap_log, progress_cb=progress_cb)
     if phase_cb:
         phase_cb(84, 'installing spconv/PyG')
-    _install_spconv_and_pyg(runtime, bootstrap_log, heartbeat_cb=heartbeat_cb)
+    _install_spconv_and_pyg(runtime, state, bootstrap_log, progress_cb=progress_cb)
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'ok')
 
 
-def _install_torch(runtime: RuntimeContext, log_path: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
+def _is_module_importable(runtime: RuntimeContext, module_name: str) -> bool:
+    try:
+        _run_capture([str(runtime.python_exe), '-c', f'import {module_name}; print("ok")'], cwd=runtime.repo_dir)
+        return True
+    except Exception:
+        return False
+
+
+def _install_torch(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    if _phase_marked(runtime, 'install_torch') and _is_module_importable(runtime, 'torch'):
+        _log_bootstrap_event(log_path, 'installing torch', 'ok', 'skipped: already installed')
+        _complete_phase(state, 'install_torch')
+        return
     torch_spec = os.environ.get('MODLY_UNIRIG_TORCH_SPEC', DEFAULT_TORCH_SPEC)
     cmd = _pip_install_command(runtime, shlex.split(torch_spec))
     torch_index_url = os.environ.get('MODLY_UNIRIG_TORCH_INDEX_URL')
     if torch_index_url:
         cmd.extend(['--index-url', torch_index_url])
-    _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path, phase='installing torch', heartbeat_cb=heartbeat_cb)
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        cmd,
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='installing torch',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing torch'],
+    )
+    _mark_phase(runtime, 'install_torch')
+    _complete_phase(state, 'install_torch')
 
 
-def _install_filtered_requirements(runtime: RuntimeContext, log_path: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
+def _install_filtered_requirements(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
     requirements_path = runtime.repo_dir / 'requirements.txt'
     if not requirements_path.exists():
         raise WorkspaceToolError(f'UniRig requirements.txt not found: {requirements_path}')
@@ -1020,13 +1227,49 @@ def _install_filtered_requirements(runtime: RuntimeContext, log_path: Path, hear
     filtered_text = _filtered_requirements_text(requirements_path.read_text(encoding='utf-8'))
     filtered_path = runtime.runtime_root / 'requirements.filtered.txt'
     filtered_path.write_text(filtered_text, encoding='utf-8')
-    _run_logged(
-        _pip_install_command(runtime, ['-r', str(filtered_path)]),
-        cwd=runtime.repo_dir,
-        log_path=log_path,
-        phase='installing UniRig requirements',
-        heartbeat_cb=heartbeat_cb,
-    )
+    grouped = _split_requirements_groups(filtered_text)
+    (runtime.runtime_root / 'requirements.core.txt').write_text('\n'.join(grouped['core_python_libs']).rstrip() + '\n', encoding='utf-8')
+    (runtime.runtime_root / 'requirements.hf.txt').write_text('\n'.join(grouped['huggingface_transformers']).rstrip() + '\n', encoding='utf-8')
+    (runtime.runtime_root / 'requirements.geometry.txt').write_text('\n'.join(grouped['geometry_runtime_libs']).rstrip() + '\n', encoding='utf-8')
+    (runtime.runtime_root / 'requirements.optional.txt').write_text('\n'.join(grouped['optional_extras']).rstrip() + '\n', encoding='utf-8')
+    phase_map = [
+        ('core_python_libs', 'installing core requirements'),
+        ('huggingface_transformers', 'installing huggingface/transformers'),
+        ('geometry_runtime_libs', 'installing geometry/runtime libs'),
+    ]
+    for phase_key, phase_name in phase_map:
+        lines = grouped[phase_key]
+        if not lines:
+            _mark_phase(runtime, phase_key)
+            _complete_phase(state, phase_key)
+            continue
+        if _phase_marked(runtime, phase_key):
+            _complete_phase(state, phase_key)
+            continue
+        tmp_path = runtime.runtime_root / f'requirements.{phase_key}.txt'
+        tmp_path.write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8')
+        _run_subprocess_with_heartbeat(
+            runtime,
+            state,
+            progress_cb,
+            _pip_install_command(runtime, ['-r', str(tmp_path)]),
+            cwd=runtime.repo_dir,
+            log_path=log_path,
+            phase=phase_name,
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing core requirements'],
+        )
+        _mark_phase(runtime, phase_key)
+        _complete_phase(state, phase_key)
+
+    if grouped['optional_extras'] and not _phase_marked(runtime, 'optional_extras'):
+        _log_bootstrap_event(
+            log_path,
+            'installing optional extras',
+            'ok',
+            f"skipped by default ({', '.join(sorted(_base_requirement_name(line) for line in grouped['optional_extras']))})",
+        )
+        _mark_phase(runtime, 'optional_extras')
+        _complete_phase(state, 'optional_extras')
 
 
 def _filtered_requirements_text(raw_text: str) -> str:
@@ -1055,20 +1298,116 @@ def _base_requirement_name(requirement_line: str) -> str:
     return cleaned.replace('_', '-').lower()
 
 
-def _install_spconv_and_pyg(runtime: RuntimeContext, log_path: Path, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
+def _split_requirements_groups(raw_text: str) -> dict[str, list[str]]:
+    huggingface = {'transformers', 'huggingface-hub', 'tokenizers', 'safetensors', 'accelerate', 'sentencepiece', 'timm'}
+    geometry = {'trimesh', 'open3d', 'pymeshlab', 'pygltflib', 'rtree', 'xatlas', 'scikit-image', 'opencv-python', 'opencv-python-headless'}
+    optional = {'pytorch-lightning', 'lightning', 'wandb', 'dash', 'ipywidgets', 'flask', 'open3d', 'bpy'}
+    groups = {
+        'core_python_libs': [],
+        'huggingface_transformers': [],
+        'geometry_runtime_libs': [],
+        'optional_extras': [],
+    }
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        pkg = _base_requirement_name(stripped)
+        if pkg in optional:
+            groups['optional_extras'].append(stripped)
+        elif pkg in huggingface:
+            groups['huggingface_transformers'].append(stripped)
+        elif pkg in geometry:
+            groups['geometry_runtime_libs'].append(stripped)
+        else:
+            groups['core_python_libs'].append(stripped)
+    return groups
+
+
+def _validate_core_pipeline_imports(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    if _phase_marked(runtime, 'validate_core_imports'):
+        _complete_phase(state, 'validate_core_imports')
+        return
+    command = [
+        str(runtime.python_exe),
+        '-c',
+        'import importlib; '
+        "mods=['torch','numpy','scipy','trimesh']; "
+        '[importlib.import_module(m) for m in mods]; '
+        "print('core imports ok')",
+    ]
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        command,
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='validating core imports',
+        timeout_sec=PHASE_TIMEOUTS_SEC['validating CUDA'],
+    )
+    _mark_phase(runtime, 'validate_core_imports')
+    _complete_phase(state, 'validate_core_imports')
+
+
+def _install_spconv_and_pyg(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    if _phase_marked(runtime, 'spconv_pyg'):
+        _complete_phase(state, 'spconv_pyg')
+        _log_bootstrap_event(log_path, 'installing spconv/PyG', 'ok', 'skipped: marker exists')
+        return
     spconv_package = os.environ.get('MODLY_UNIRIG_SPCONV_PACKAGE', DEFAULT_SPCONV_PACKAGE)
-    _run_logged(_pip_install_command(runtime, [spconv_package]), cwd=runtime.repo_dir, log_path=log_path, phase='installing spconv/PyG', heartbeat_cb=heartbeat_cb)
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        _pip_install_command(runtime, [spconv_package]),
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='installing spconv/PyG',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing spconv/PyG'],
+    )
 
     pyg_url = os.environ.get('MODLY_UNIRIG_PYG_WHEEL_URL')
     if not pyg_url:
         torch_build = _query_torch_build(runtime)
         pyg_url = f"https://data.pyg.org/whl/torch-{torch_build['torch']}+{torch_build['cuda']}.html"
     cmd = _pip_install_command(runtime, [*DEFAULT_PYG_PACKAGES, '-f', pyg_url, '--no-cache-dir'])
-    _run_logged(cmd, cwd=runtime.repo_dir, log_path=log_path, phase='installing spconv/PyG', heartbeat_cb=heartbeat_cb)
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        cmd,
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='installing spconv/PyG',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing spconv/PyG'],
+    )
+    _mark_phase(runtime, 'spconv_pyg')
+    _complete_phase(state, 'spconv_pyg')
 
 
 def _pip_install_command(runtime: RuntimeContext, args: Sequence[str]) -> list[str]:
-    cmd = [str(runtime.python_exe), '-m', 'pip', 'install', *args]
+    cmd = [
+        str(runtime.python_exe),
+        '-m',
+        'pip',
+        'install',
+        '--disable-pip-version-check',
+        '--progress-bar',
+        'off',
+        '--no-input',
+        *args,
+    ]
     wheelhouse = os.environ.get('MODLY_UNIRIG_WHEELHOUSE_DIR')
     if wheelhouse:
         cmd.extend(['--no-index', '--find-links', wheelhouse])

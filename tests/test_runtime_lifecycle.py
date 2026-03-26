@@ -223,7 +223,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     'selected_python_source': 'PATH_python',
                     'attempts': [],
                     'phases': [],
-                }), patch('generator._create_venv', return_value=None), patch('generator._bootstrap_runtime', return_value=None), patch(
+                }), patch('generator._run_subprocess_with_heartbeat', return_value=None), patch('generator._bootstrap_runtime', return_value=None), patch(
                     'generator._validate_runtime', return_value={'python': {'major': 3, 'minor': 11}, 'gpu': {'cuda': True}}
                 ):
                     status = tool.install_runtime(progress_cb=lambda pct, step: progress.append((pct, step)))
@@ -293,6 +293,112 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     generator._download_unirig_repo(runtime, heartbeat_cb=heartbeat)
 
                 self.assertGreaterEqual(heartbeat_calls['count'], 2)
+
+    def test_subprocess_heartbeat_without_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.runtime_root.mkdir(parents=True, exist_ok=True)
+                log_path = runtime.runtime_root / 'bootstrap.log'
+                state = generator._default_bootstrap_state(runtime)
+                generator._set_state_and_report(runtime, state, None, 10, 'installing core requirements')
+                generator._run_subprocess_with_heartbeat(
+                    runtime=runtime,
+                    state=state,
+                    progress_cb=None,
+                    command=[sys.executable, '-c', 'import time; time.sleep(6)'],
+                    cwd=runtime.runtime_root,
+                    log_path=log_path,
+                    phase='installing core requirements',
+                    timeout_sec=30,
+                )
+                saved = generator._load_bootstrap_state(runtime)
+                self.assertFalse(saved['subprocess_alive'])
+                self.assertIsNotNone(saved['last_heartbeat_at'])
+                self.assertTrue(log_path.exists())
+
+    def test_runtime_status_with_active_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                payload = generator._default_bootstrap_state(runtime)
+                payload.update({'install_state': 'installing', 'subprocess_alive': True, 'subprocess_pid': 1234, 'subprocess_cmd': 'pip install -r reqs.txt'})
+                generator._write_bootstrap_state(runtime, payload)
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                status = tool.runtime_status()
+                self.assertTrue(status['subprocess_alive'])
+                self.assertEqual(status['subprocess_pid'], 1234)
+
+    def test_resume_skips_venv_and_torch_when_marked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                runtime.python_exe.parent.mkdir(parents=True, exist_ok=True)
+                runtime.python_exe.write_text('', encoding='utf-8')
+                generator._mark_phase(runtime, 'create_venv')
+                generator._mark_phase(runtime, 'install_torch')
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                with patch('generator._resolve_python311_command', return_value={
+                    'command': ['python3.11'],
+                    'selected_python': 'python3.11',
+                    'selected_python_version': '3.11.9',
+                    'selected_python_source': 'PATH_python',
+                    'attempts': [],
+                    'phases': [],
+                }), patch('generator._is_venv_valid', return_value=True), patch('generator._is_module_importable', return_value=True), patch(
+                    'generator._bootstrap_runtime',
+                    return_value=None,
+                ), patch('generator._validate_runtime', return_value={'python': {'major': 3, 'minor': 11}, 'gpu': {'cuda': True}}), patch(
+                    'generator._run_subprocess_with_heartbeat',
+                    side_effect=AssertionError('should not reinstall venv'),
+                ):
+                    status = tool.install_runtime()
+                self.assertEqual(status['install_state'], 'ready')
+
+    def test_state_persists_between_repair_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                payload = generator._default_bootstrap_state(runtime)
+                payload.update({'install_state': 'installing', 'completed_phases': ['prepare_repo', 'create_venv']})
+                generator._write_bootstrap_state(runtime, payload)
+                first = generator._load_bootstrap_state(runtime)
+                second = generator._normalize_state(first, runtime)
+                self.assertIn('prepare_repo', second['completed_phases'])
+                self.assertIn('create_venv', second['completed_phases'])
+
+    def test_last_error_excerpt_is_saved_on_phase_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {'MODLY_UNIRIG_RUNTIME_DIR': tmp, 'MODLY_UNIRIG_PYTHON311_BIN': sys.executable},
+                clear=False,
+            ):
+                tool = generator.UniRigWorkspaceTool(Path(tmp))
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                (runtime.repo_dir / 'run.py').write_text('# stub', encoding='utf-8')
+                with patch.object(generator.UniRigWorkspaceTool, '_prepare_repo', return_value=False), patch(
+                    'generator._resolve_python311_command',
+                    return_value={
+                        'command': [sys.executable],
+                        'selected_python': sys.executable,
+                        'selected_python_version': '3.11.9',
+                        'selected_python_source': 'PATH_python',
+                        'attempts': [],
+                        'phases': [],
+                    },
+                ), patch('generator._is_venv_valid', return_value=False), patch(
+                    'generator._run_subprocess_with_heartbeat',
+                    side_effect=_WorkspaceToolError('synthetic pip failure'),
+                ):
+                    with self.assertRaises(_WorkspaceToolError):
+                        tool.install_runtime()
+                saved = generator._load_bootstrap_state(runtime)
+                self.assertEqual(saved['install_state'], 'error')
+                self.assertTrue(saved.get('last_error_excerpt'))
 
 
 if __name__ == '__main__':
