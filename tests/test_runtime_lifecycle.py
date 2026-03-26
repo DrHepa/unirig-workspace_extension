@@ -123,7 +123,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
 
                 with patch('generator._run_subprocess_with_heartbeat', side_effect=capture_cmd), patch(
                     'generator._ensure_flash_attn_windows_toolchain',
-                    return_value=None,
+                    return_value={},
                 ), patch('generator._query_flash_attn_version', return_value='2.7.4.post1'), patch(
                     'generator._is_module_importable',
                     return_value=True,
@@ -131,6 +131,108 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     generator._install_flash_attn(runtime, state, runtime.runtime_root / 'bootstrap.log', profile, force=True)
                 install_cmd = called[-1]
                 self.assertIn('--no-build-isolation', install_cmd)
+
+    def test_resolve_ninja_from_venv_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                scripts = runtime.venv_dir / 'Scripts'
+                scripts.mkdir(parents=True, exist_ok=True)
+                ninja = scripts / 'ninja.exe'
+                ninja.write_text('', encoding='utf-8')
+                with patch('generator._probe_executable', return_value=True):
+                    resolved = generator._resolve_ninja_executable(runtime)
+                self.assertEqual(str(ninja), resolved)
+
+    def test_windows_flash_attn_command_prepares_path_and_cuda(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                toolchain = {
+                    'resolved_cuda_home': r'C:\CUDA\v12.8',
+                    'resolved_cuda_bin': r'C:\CUDA\v12.8\bin',
+                    'resolved_vcvars_path': r'C:\VS\vcvars64.bat',
+                    'resolved_ninja_path': str(runtime.venv_dir / 'Scripts' / 'ninja.exe'),
+                }
+                cmd = generator._windows_flash_attn_install_command(runtime, toolchain, 'flash_attn==2.7.4.post1', max_jobs=4)
+                self.assertEqual(cmd[0].lower(), 'cmd.exe')
+                rendered = cmd[-1]
+                self.assertIn('call "C:\\VS\\vcvars64.bat"', rendered)
+                self.assertIn('set "CUDA_HOME=C:\\CUDA\\v12.8"', rendered)
+                self.assertIn('set "PATH=', rendered)
+                self.assertIn('Scripts;C:\\CUDA\\v12.8\\bin;%PATH%"', rendered)
+                self.assertIn('--no-build-isolation flash_attn==2.7.4.post1', rendered)
+
+    def test_resolve_vcvars_via_vswhere(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            install = base / 'VS'
+            vcvars = install / 'VC' / 'Auxiliary' / 'Build' / 'vcvars64.bat'
+            vcvars.parent.mkdir(parents=True, exist_ok=True)
+            vcvars.write_text('', encoding='utf-8')
+            cl = install / 'VC' / 'Tools' / 'MSVC' / '14.40.33807' / 'bin' / 'Hostx64' / 'x64' / 'cl.exe'
+            cl.parent.mkdir(parents=True, exist_ok=True)
+            cl.write_text('', encoding='utf-8')
+            with patch('generator._resolve_vswhere_path', return_value='vswhere.exe'), patch(
+                'generator.subprocess.run',
+                return_value=types.SimpleNamespace(returncode=0, stdout=str(install), stderr=''),
+            ):
+                _vswhere, resolved_vcvars, resolved_cl = generator._resolve_msvc_toolchain_paths()
+            self.assertEqual(str(vcvars), resolved_vcvars)
+            self.assertEqual(str(cl), resolved_cl)
+
+    def test_resolve_cuda_from_env_vars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cuda = Path(tmp) / 'cuda'
+            nvcc = cuda / 'bin' / 'nvcc.exe'
+            nvcc.parent.mkdir(parents=True, exist_ok=True)
+            nvcc.write_text('', encoding='utf-8')
+            with tempfile.TemporaryDirectory() as rt:
+                with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': rt, 'CUDA_HOME': str(cuda)}, clear=False):
+                    runtime = generator._resolve_runtime_context()
+                    with patch('generator._probe_executable', return_value=True), patch(
+                        'generator._read_nvcc_version',
+                        return_value='12.8',
+                    ):
+                        home, _bin, nvcc_path, version = generator._resolve_cuda_toolkit_paths(runtime)
+                    self.assertEqual(str(cuda), home)
+                    self.assertEqual(str(nvcc), nvcc_path)
+                    self.assertEqual('12.8', version)
+
+    def test_resolve_cuda_from_standard_locations_when_env_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cuda = Path(tmp) / 'cuda_std'
+            nvcc = cuda / 'bin' / 'nvcc.exe'
+            nvcc.parent.mkdir(parents=True, exist_ok=True)
+            nvcc.write_text('', encoding='utf-8')
+            with tempfile.TemporaryDirectory() as rt:
+                with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': rt}, clear=False):
+                    runtime = generator._resolve_runtime_context()
+                    with patch('generator._iter_standard_cuda_homes', return_value=[cuda]), patch(
+                        'generator._probe_executable',
+                        return_value=True,
+                    ), patch('generator._read_nvcc_version', return_value='12.8'):
+                        home, _bin, nvcc_path, _version = generator._resolve_cuda_toolkit_paths(runtime)
+                self.assertEqual(str(cuda), home)
+                self.assertEqual(str(nvcc), nvcc_path)
+
+    def test_required_imports_include_flash_attn(self) -> None:
+        modules = [name for name, _stmt in generator.REQUIRED_IMPORTS]
+        self.assertIn('flash_attn', modules)
+
+    def test_repair_missing_dependencies_only_reinstalls_flash_attn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                state = generator._default_bootstrap_state(runtime)
+                profile = generator.get_supported_runtime_profiles()[0]
+                with patch('generator._query_missing_required_modules', side_effect=[['flash_attn'], []]), patch(
+                    'generator._install_flash_attn',
+                ) as install_flash, patch('generator._install_official_requirements') as install_official:
+                    generator._repair_missing_unirig_dependencies(runtime, state, runtime.runtime_root / 'bootstrap.log', profile)
+                install_flash.assert_called_once()
+                install_official.assert_not_called()
 
     def test_runtime_profile_resolver_prefers_win_cu128_on_windows_nvidia(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

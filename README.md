@@ -44,9 +44,9 @@ Useful overrides when packaging or debugging:
 - `MODLY_UNIRIG_FLASH_ATTN_SPEC`
   - Override the pinned flash-attn spec used by the dedicated install phase (default profile pin: `flash_attn==2.7.4.post1`).
 - `MODLY_UNIRIG_FLASH_ATTN_WHEEL`
-  - Absolute local wheel path for flash-attn; takes precedence over spec/source install.
+  - Absolute local wheel path for flash-attn (expert override only; default path is source build with resolved Windows toolchain).
 - `MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL`
-  - Remote wheel URL for flash-attn; used when local wheel override is not set.
+  - Remote wheel URL for flash-attn (expert override only; default path is source build).
 - `MODLY_UNIRIG_ENFORCE_GPU=0`
   - Allow bootstrap/inference without enforcing CUDA availability.
 - `MODLY_UNIRIG_MIN_VRAM_GB`
@@ -58,3 +58,9 @@ Useful overrides when packaging or debugging:
 - The tool intentionally isolates UniRig dependencies from Modly's main runtime.
 - `flash_attn` remains mandatory, but it is installed in a dedicated phase (`--no-build-isolation` for spec installs) instead of the generic `pip install -r requirements.txt`.
 - Intermediate stage FBX files are temporary; the persistent output returned to the workspace is a new rigged `.glb` plus `*.rigmeta.json`.
+
+## Windows/NVIDIA flash-attn flow
+
+- `flash_attn` is required and installed in a dedicated phase after official requirements.
+- On Windows, the extension preflights and resolves: venv `ninja.exe`, Visual Studio Build Tools (`vswhere` + `vcvars64.bat`), and CUDA toolkit (`nvcc`, `CUDA_HOME/CUDA_PATH`, or standard toolkit paths).
+- The default install route follows the official source-build guidance using `--no-build-isolation` inside an environment prepared through `vcvars64.bat` (no manual Developer Prompt required).
