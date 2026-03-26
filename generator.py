@@ -140,13 +140,12 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             )
 
             _set_state_and_report(runtime, state, progress_cb, 35, 'preparing UniRig repo')
-            downloaded_repo = self._prepare_repo(
+            self._prepare_repo(
                 runtime,
                 bootstrap_log=bootstrap_log,
                 heartbeat_cb=lambda: _heartbeat_state(runtime, state, progress_cb),
+                phase_cb=lambda percent, step: _set_state_and_report(runtime, state, progress_cb, percent, step),
             )
-            if downloaded_repo:
-                _set_state_and_report(runtime, state, progress_cb, 42, 'downloading UniRig repo')
             _append_install_phase(state, 'prepare_repo', 'ok')
             _write_bootstrap_state(runtime, state)
 
@@ -337,12 +336,18 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         runtime: RuntimeContext,
         bootstrap_log: Path | None = None,
         heartbeat_cb: Optional[Callable[[], None]] = None,
+        phase_cb: Optional[Callable[[int, str], None]] = None,
     ) -> bool:
         if runtime.repo_dir.exists() and (runtime.repo_dir / 'run.py').exists():
             return False
         if runtime.external_repo:
             raise WorkspaceToolError(f'UniRig repo override is invalid: {runtime.repo_dir}')
-        _download_unirig_repo(runtime, bootstrap_log=bootstrap_log, heartbeat_cb=heartbeat_cb)
+        _download_unirig_repo(
+            runtime,
+            bootstrap_log=bootstrap_log,
+            heartbeat_cb=heartbeat_cb,
+            phase_cb=phase_cb,
+        )
         return True
 
     @staticmethod
@@ -569,7 +574,12 @@ def _append_install_phase(state: dict, phase: str, status: str, detail: str = ''
         phases.append({'phase': phase, 'status': status, 'detail': detail, 'at': int(time.time())})
 
 
-def _download_unirig_repo(runtime: RuntimeContext, bootstrap_log: Path | None = None, heartbeat_cb: Optional[Callable[[], None]] = None) -> None:
+def _download_unirig_repo(
+    runtime: RuntimeContext,
+    bootstrap_log: Path | None = None,
+    heartbeat_cb: Optional[Callable[[], None]] = None,
+    phase_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
     archive_url = os.environ.get('MODLY_UNIRIG_REPO_ARCHIVE_URL', OFFICIAL_UNIRIG_ARCHIVE_URL)
     tmp_dir = runtime.runtime_root / '_repo_download'
     if tmp_dir.exists():
@@ -578,6 +588,8 @@ def _download_unirig_repo(runtime: RuntimeContext, bootstrap_log: Path | None = 
     archive_path = tmp_dir / 'unirig.tar.gz'
 
     try:
+        if phase_cb:
+            phase_cb(42, 'downloading UniRig repo')
         if bootstrap_log:
             _log_bootstrap_event(bootstrap_log, 'downloading UniRig repo', 'start', archive_url)
         _download_file(archive_url, archive_path, heartbeat_cb=heartbeat_cb)
@@ -593,10 +605,11 @@ def _download_unirig_repo(runtime: RuntimeContext, bootstrap_log: Path | None = 
     extract_dir = tmp_dir / 'extract'
     extract_dir.mkdir(parents=True, exist_ok=True)
     try:
+        if phase_cb:
+            phase_cb(48, 'extracting UniRig repo')
         if bootstrap_log:
             _log_bootstrap_event(bootstrap_log, 'extracting UniRig repo', 'start', str(archive_path))
-        with tarfile.open(archive_path, 'r:gz') as tar_file:
-            tar_file.extractall(extract_dir)
+        _extract_archive(archive_path, extract_dir, heartbeat_cb=heartbeat_cb)
         if bootstrap_log:
             _log_bootstrap_event(bootstrap_log, 'extracting UniRig repo', 'ok')
     except Exception as exc:
