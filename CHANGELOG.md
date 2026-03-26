@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0 - 2026-03-26
+
+### Resumen
+- Se cambió la estrategia de bootstrap en Windows/NVIDIA a `install_mode=artifact` por defecto, con ruta `source` reservada a modo desarrollador explícito.
+- Se añadió soporte de runtime manifest versionado (`runtime-manifest.win-cu128-stable.json`) con metadata de perfil, versiones pinneadas, assets, checksum y comandos de validación.
+- Se implementó instalación determinista desde wheelhouse artifact (`--no-index --find-links ... -r runtime-lock.txt`) y reparación de runtime reutilizando el artifact.
+- Se amplió `bootstrap_state.json` con campos de `install_mode`, manifest/artifact y estado de validación del runtime.
+- Se corrigió el formateo de versión CUDA para evitar mensajes como `CUDA Toolkit 1.28 not found` (ahora `12.8`).
+- Se añadieron scripts de builder/validator para generar y validar artifacts publicables en GitHub Releases.
+
+### Archivos cambiados
+- `generator.py`
+- `tests/test_runtime_lifecycle.py`
+- `runtime-manifest.win-cu128-stable.json`
+- `scripts/build_runtime_wheelhouse_win_cu128.ps1`
+- `scripts/validate_runtime_wheelhouse.ps1`
+- `README.md`
+- `manifest.json`
+- `CHANGELOG.md`
+
 ## 0.1.6 - 2026-03-26
 
 ### Resumen

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import hashlib
 import queue
 import re
 import shlex
@@ -26,7 +27,7 @@ from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 
 OFFICIAL_UNIRIG_ARCHIVE_URL = 'https://api.github.com/repos/VAST-AI-Research/UniRig/tarball/HEAD'
-BOOTSTRAP_VERSION = 6
+BOOTSTRAP_VERSION = 7
 PYTHON_STANDALONE_VERSION = '3.11.9'
 PYTHON_STANDALONE_RELEASE = '20240726'
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
@@ -43,6 +44,11 @@ PHASE_TIMEOUTS_SEC = {
     'installing spconv/PyG': 3600,
     'validating CUDA': 900,
 }
+DEFAULT_INSTALL_MODE = 'artifact'
+INSTALL_MODES = {'artifact', 'source'}
+RUNTIME_MANIFEST_VERSION = 1
+DEFAULT_RUNTIME_MANIFEST_FILE = 'runtime-manifest.win-cu128-stable.json'
+DEFAULT_RUNTIME_RELEASE_REPO = 'DrHepa/unirig-workspace_extension'
 
 DIRECT_INPUT_SUFFIXES = {'.obj', '.fbx', '.glb', '.vrm'}
 CONVERTIBLE_INPUT_SUFFIXES = {'.gltf', '.stl', '.ply'}
@@ -225,7 +231,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _append_install_phase(state, 'create_venv', 'ok')
             _write_bootstrap_state(runtime, state)
 
-            _set_state_and_report(runtime, state, progress_cb, 65, 'installing torch')
+            _set_state_and_report(runtime, state, progress_cb, 65, 'Installing UniRig runtime')
             _bootstrap_runtime(
                 runtime,
                 state,
@@ -241,7 +247,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 state,
                 progress_cb,
                 92,
-                'validating required imports',
+                'Validating UniRig runtime',
                 phase_timeout_sec=PHASE_TIMEOUTS_SEC['validating CUDA'],
                 phase_started_at=int(time.time()),
             )
@@ -249,13 +255,16 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _complete_phase(state, 'validate_cuda')
             _append_install_phase(state, 'validate', 'ok')
             state['missing_required_modules'] = validation.get('missing_required_modules', [])
-            state['runpy_smoke_ok'] = bool(validation.get('runpy_smoke_ok'))
-            state['required_baseline_installed'] = bool(validation.get('baseline_installed'))
+            state['runpy_smoke_ok'] = bool(validation.get('runpy_smoke_ok', True))
+            state['required_baseline_installed'] = bool(validation.get('baseline_installed', True))
+            state['runtime_validation_ok'] = not bool(state['missing_required_modules']) and state['runpy_smoke_ok']
             state['flash_attn_validation_ok'] = 'flash_attn' not in state['missing_required_modules']
             if state['flash_attn_validation_ok']:
                 state['flash_attn_last_error'] = ''
             state['last_validation_error'] = ''
             _write_bootstrap_state(runtime, state)
+            if not state['runtime_validation_ok']:
+                raise WorkspaceToolError('UniRig runtime validation failed (required imports or run.py --help).')
 
             _set_state_and_report(
                 runtime,
@@ -263,6 +272,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 progress_cb,
                 100,
                 'ready',
+                message='UniRig runtime ready',
                 install_state='ready',
                 completed_at=int(time.time()),
                 last_error='',
@@ -278,6 +288,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             return state
         except Exception as exc:
             state['last_validation_error'] = str(exc)
+            state['runtime_validation_ok'] = False
             if not state.get('last_error_excerpt') and state.get('bootstrap_log'):
                 state['last_error_excerpt'] = _tail_text(Path(str(state['bootstrap_log'])), 80)
             _set_state_and_report(
@@ -560,6 +571,23 @@ def _runtime_ready(runtime: RuntimeContext) -> bool:
     )
 
 
+def _source_build_override_enabled() -> bool:
+    explicit_mode = os.environ.get('MODLY_UNIRIG_INSTALL_MODE', '').strip().lower() == 'source'
+    dev_override = _env_truthy('MODLY_UNIRIG_DEV_SOURCE_BOOTSTRAP', False)
+    return explicit_mode or dev_override
+
+
+def resolve_install_mode() -> str:
+    mode = os.environ.get('MODLY_UNIRIG_INSTALL_MODE', '').strip().lower()
+    if mode in INSTALL_MODES:
+        return mode
+    if _source_build_override_enabled():
+        return 'source'
+    if platform.system().lower() == 'windows':
+        return 'artifact'
+    return 'source'
+
+
 def get_supported_runtime_profiles() -> list[RuntimeProfile]:
     return [
         RuntimeProfile(
@@ -665,6 +693,7 @@ def _bootstrap_state_path(runtime: RuntimeContext) -> Path:
 
 def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
     now = int(time.time())
+    install_mode = resolve_install_mode()
     return {
         'bootstrap_version': BOOTSTRAP_VERSION,
         'install_state': 'not_installed',
@@ -699,7 +728,14 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'selected_pyg_wheel_url': '',
         'selected_torch_index_url': '',
         'binary_only_mode': True,
+        'install_mode': install_mode,
+        'source_build_enabled': install_mode == 'source',
         'source_build_allowed': _env_truthy('MODLY_UNIRIG_ALLOW_SOURCE_BUILDS', False),
+        'runtime_manifest_version': '',
+        'runtime_artifact_url': '',
+        'runtime_artifact_sha256': '',
+        'runtime_artifact_cached': False,
+        'runtime_validation_ok': False,
         'required_baseline_source': '',
         'required_baseline_installed': False,
         'flash_attn_required': True,
@@ -731,6 +767,11 @@ def _normalize_state(state: dict, runtime: RuntimeContext) -> dict:
     if normalized.get('install_state') not in INSTALL_STATES:
         normalized['install_state'] = 'error'
         normalized['last_error'] = f"Unknown install_state value: {normalized.get('install_state')}"
+    install_mode = str(normalized.get('install_mode') or '').strip().lower()
+    if install_mode not in INSTALL_MODES:
+        install_mode = resolve_install_mode()
+    normalized['install_mode'] = install_mode
+    normalized['source_build_enabled'] = install_mode == 'source'
     return normalized
 
 
@@ -1323,9 +1364,12 @@ def _bootstrap_runtime(
     phase_cb: Optional[Callable[[int, str], None]] = None,
 ) -> None:
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'start', 'resumable phases enabled')
+    install_mode = resolve_install_mode()
     profile, profile_meta = resolve_runtime_profile(runtime)
     state.update(
         {
+            'install_mode': install_mode,
+            'source_build_enabled': install_mode == 'source',
             'selected_runtime_profile': profile.profile_id,
             'selected_torch_version': profile.torch,
             'selected_cuda_flavor': profile.cuda_flavor,
@@ -1359,19 +1403,145 @@ def _bootstrap_runtime(
         _mark_phase(runtime, 'upgrade_pip')
         _complete_phase(state, 'upgrade_pip')
     if phase_cb:
-        phase_cb(68, 'installing torch')
-    _install_torch(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
-    if phase_cb:
-        phase_cb(76, 'installing official UniRig requirements')
-    _install_official_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
-    if phase_cb:
-        phase_cb(80, 'installing flash-attn')
-    _install_flash_attn(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
-    if phase_cb:
-        phase_cb(84, 'installing spconv/PyG')
-    _install_spconv_and_pyg(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
+        phase_cb(68, 'Downloading UniRig runtime')
+    if install_mode == 'artifact':
+        _install_runtime_from_artifact(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
+    else:
+        if phase_cb:
+            phase_cb(68, 'installing torch')
+        _install_torch(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
+        if phase_cb:
+            phase_cb(76, 'installing official UniRig requirements')
+        _install_official_requirements(runtime, state, bootstrap_log, progress_cb=progress_cb)
+        if phase_cb:
+            phase_cb(80, 'installing flash-attn')
+        _install_flash_attn(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
+        if phase_cb:
+            phase_cb(84, 'installing spconv/PyG')
+        _install_spconv_and_pyg(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     _repair_missing_unirig_dependencies(runtime, state, bootstrap_log, profile, progress_cb=progress_cb)
     _log_bootstrap_event(bootstrap_log, 'bootstrap deps', 'ok')
+
+
+def _install_runtime_from_artifact(
+    runtime: RuntimeContext,
+    state: dict,
+    log_path: Path,
+    profile: RuntimeProfile,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    manifest = _load_runtime_manifest(profile.profile_id)
+    asset = _select_runtime_asset(manifest)
+    state['runtime_manifest_version'] = str(manifest.get('manifest_version', ''))
+    state['runtime_artifact_url'] = str(asset.get('url', ''))
+    state['runtime_artifact_sha256'] = str(asset.get('sha256', ''))
+    _write_bootstrap_state(runtime, state)
+    artifact_file = _download_runtime_artifact(runtime, manifest, asset, log_path, progress_cb=progress_cb)
+    state['runtime_artifact_cached'] = artifact_file.exists()
+    _write_bootstrap_state(runtime, state)
+    extracted = _extract_runtime_artifact(runtime, artifact_file, profile.profile_id)
+    _install_from_wheelhouse(runtime, state, extracted, log_path, progress_cb=progress_cb)
+
+
+def _load_runtime_manifest(profile_id: str) -> dict:
+    manifest_url = os.environ.get('MODLY_UNIRIG_RUNTIME_MANIFEST_URL', '').strip()
+    local_manifest = Path(__file__).resolve().parent / DEFAULT_RUNTIME_MANIFEST_FILE
+    try:
+        if manifest_url:
+            request = urllib.request.Request(manifest_url, headers={'User-Agent': 'Modly-UniRig-RuntimeManifest'})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+        else:
+            payload = json.loads(local_manifest.read_text(encoding='utf-8'))
+    except Exception as exc:
+        raise WorkspaceToolError(f'UniRig runtime artifact unavailable (manifest load failed: {exc})') from exc
+    if not isinstance(payload, dict):
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (manifest format invalid).')
+    if payload.get('profile_id') != profile_id:
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (profile mismatch in manifest).')
+    if payload.get('install_mode') != 'artifact':
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (manifest install_mode must be artifact).')
+    return payload
+
+
+def _select_runtime_asset(manifest: dict) -> dict:
+    assets = manifest.get('assets', [])
+    if not isinstance(assets, list) or not assets:
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (manifest has no assets).')
+    first = assets[0]
+    if not isinstance(first, dict) or not first.get('url') or not first.get('sha256'):
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (asset is missing url/sha256).')
+    return first
+
+
+def _download_runtime_artifact(
+    runtime: RuntimeContext,
+    manifest: dict,
+    asset: dict,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Path:
+    cache_dir = runtime.runtime_root / 'runtime_artifacts' / str(manifest.get('profile_id', 'artifact'))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    filename = str(asset.get('name') or Path(str(asset.get('url'))).name or 'runtime-artifact.zip')
+    target = cache_dir / filename
+    expected_sha = str(asset.get('sha256', '')).strip().lower()
+    if target.exists() and expected_sha and _sha256_of_file(target) == expected_sha:
+        _log_bootstrap_event(log_path, 'runtime artifact', 'ok', f'cache hit: {target}')
+        return target
+    url = str(asset.get('url'))
+    if progress_cb:
+        progress_cb(70, 'Downloading UniRig runtime')
+    if url.startswith('file://'):
+        shutil.copy2(Path(url[7:]), target)
+    elif Path(url).exists():
+        shutil.copy2(Path(url), target)
+    else:
+        _download_file(url, target)
+    digest = _sha256_of_file(target)
+    if expected_sha and digest != expected_sha:
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (checksum mismatch).')
+    return target
+
+
+def _extract_runtime_artifact(runtime: RuntimeContext, artifact: Path, profile_id: str) -> Path:
+    extract_dir = runtime.runtime_root / 'runtime_artifacts' / profile_id / 'extracted'
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    _extract_archive(artifact, extract_dir)
+    return extract_dir
+
+
+def _install_from_wheelhouse(
+    runtime: RuntimeContext,
+    state: dict,
+    extracted_dir: Path,
+    log_path: Path,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
+    lock_file = extracted_dir / 'runtime-lock.txt'
+    wheelhouse_dir = extracted_dir / 'wheelhouse'
+    if not lock_file.exists() or not wheelhouse_dir.exists():
+        raise WorkspaceToolError('UniRig runtime artifact unavailable (runtime-lock.txt or wheelhouse missing).')
+    if progress_cb:
+        progress_cb(78, 'Installing UniRig runtime')
+    cmd = _pip_install_command(
+        runtime,
+        ['--no-index', '--find-links', str(wheelhouse_dir), '-r', str(lock_file)],
+    )
+    _run_subprocess_with_heartbeat(
+        runtime,
+        state,
+        progress_cb,
+        cmd,
+        cwd=runtime.repo_dir,
+        log_path=log_path,
+        phase='installing runtime from artifact wheelhouse',
+        timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
+    )
+    _mark_phase(runtime, 'runtime_artifact')
+    _complete_phase(state, 'runtime_artifact')
 
 
 def _is_module_importable(runtime: RuntimeContext, module_name: str) -> bool:
@@ -1884,8 +2054,8 @@ def _preferred_cuda_versions_from_profile(runtime: RuntimeContext) -> list[str]:
         return []
     flavor = profile.cuda_flavor.lower().strip()
     if flavor.startswith('cu') and len(flavor) == 5 and flavor[2:].isdigit():
-        major = flavor[2]
-        minor = flavor[3:]
+        major = flavor[2:4]
+        minor = flavor[4:]
         return [f'{major}.{minor}']
     return []
 
@@ -2069,13 +2239,16 @@ def _repair_missing_unirig_dependencies(
     if not missing:
         _log_bootstrap_event(log_path, 'repairing missing UniRig dependencies', 'ok', 'no missing required modules')
         return
+    install_mode = str(state.get('install_mode') or resolve_install_mode())
     _log_bootstrap_event(
         log_path,
         'repairing missing UniRig dependencies',
         'start',
-        f"missing modules detected: {', '.join(missing)}",
+        f"missing modules detected: {', '.join(missing)}; install_mode={install_mode}",
     )
-    if set(missing) == {'flash_attn'}:
+    if install_mode == 'artifact':
+        _install_runtime_from_artifact(runtime, state, log_path, profile, progress_cb=progress_cb)
+    elif set(missing) == {'flash_attn'}:
         _install_flash_attn(runtime, state, log_path, profile, force=True, progress_cb=progress_cb)
     else:
         _install_official_requirements(runtime, state, log_path, force=True, progress_cb=progress_cb)
@@ -2360,6 +2533,17 @@ def _tail_text(path: Path, lines: int) -> str:
         return '\n'.join(content[-lines:])
     except Exception:
         return '(unable to read log file)'
+
+
+def _sha256_of_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _format_command(command: Sequence[str]) -> str:

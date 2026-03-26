@@ -2,65 +2,58 @@
 
 Workspace-tool extension for Modly.
 
-What it does:
-- takes the currently selected mesh already present in the workspace;
-- bootstraps a local isolated UniRig runtime under Modly dependencies;
-- runs the upstream UniRig skeleton stage, then the skinning stage;
-- merges the predicted rig back into the original mesh and returns a rigged `.glb` to the same workspace collection.
+## Flujo normal (Windows/NVIDIA)
+
+Desde `0.2.0`, el modo por defecto es **artifact** en Windows:
+
+1. Resolver perfil (`win-cu128-stable`).
+2. Asegurar Python 3.11 local.
+3. Crear venv local.
+4. Cargar runtime manifest versionado (`runtime-manifest.win-cu128-stable.json`).
+5. Descargar runtime artifact desde GitHub Releases.
+6. Verificar `sha256`.
+7. Extraer wheelhouse local.
+8. Instalar dependencias con:
+   - `pip install --no-index --find-links=<wheelhouse> -r runtime-lock.txt`
+9. Preparar repo UniRig fijado al ref del manifest.
+10. Validar imports requeridos y `python run.py --help`.
+11. Marcar `install_state=ready`.
+
+> Esta ruta **no** compila `flash_attn` ni usa `nvcc`, `vcvars64`, `cl.exe`.
+
+## Install mode
+
+Hay dos modos explícitos:
+
+- `artifact` (default en Windows)
+- `source` (solo dev/advanced)
+
+Overrides para activar source build:
+
+- `MODLY_UNIRIG_INSTALL_MODE=source`
+- `MODLY_UNIRIG_DEV_SOURCE_BOOTSTRAP=1`
+
+Si el artifact no está disponible y no hay override source, el error es corto y claro:
+
+- `UniRig runtime artifact unavailable`
+
+## Repair runtime
+
+En modo `artifact`, **Repair runtime** revalida y reinstala de forma determinista desde el wheelhouse local/artifact si falta algo. No entra a source build salvo override explícito.
 
 ## Runtime layout
 
-By default the tool stores its runtime cache under:
+- Cache runtime: `Settings.dependenciesDir/unirig-workspace-v1/` (o fallback local `_runtime/`).
+- Artifact cache: `runtime_artifacts/<profile_id>/`.
+- Estado persistido: `bootstrap_state.json` con campos de install mode, manifest y validación.
 
-- `Settings.dependenciesDir/unirig-workspace-v1/`
+## Variables de entorno útiles
 
-If Modly settings are unavailable, it falls back to:
-
-- `extensions/unirig-workspace-v1/_runtime/`
-
-The runtime contains:
-- a Python venv dedicated to UniRig;
-- a local checkout/cache of the official UniRig repo;
-- stage logs and bootstrap state.
-
-## Environment overrides
-
-Useful overrides when packaging or debugging:
-
-- `MODLY_UNIRIG_REPO_DIR`
-  - Use an already downloaded local UniRig repo instead of auto-downloading the upstream tarball.
-- `MODLY_UNIRIG_RUNTIME_DIR`
-  - Override the runtime/cache directory.
+- `MODLY_UNIRIG_INSTALL_MODE=artifact|source`
+- `MODLY_UNIRIG_DEV_SOURCE_BOOTSTRAP=1`
+- `MODLY_UNIRIG_RUNTIME_MANIFEST_URL`
 - `MODLY_UNIRIG_FORCE_BOOTSTRAP=1`
-  - Recreate/reinstall the UniRig runtime on the next execution.
-- `MODLY_UNIRIG_TORCH_SPEC`
-  - Override the torch install spec used by the isolated venv.
-- `MODLY_UNIRIG_TORCH_INDEX_URL`
-  - Optional extra index for CUDA-specific torch wheels.
-- `MODLY_UNIRIG_SPCONV_PACKAGE`
-  - Override the spconv package name (default: `spconv-cu120`).
-- `MODLY_UNIRIG_PYG_WHEEL_URL`
-  - Override the PyG wheel index URL for `torch_scatter` / `torch_cluster`.
-- `MODLY_UNIRIG_FLASH_ATTN_SPEC`
-  - Override the pinned flash-attn spec used by the dedicated install phase (default profile pin: `flash_attn==2.7.4.post1`).
-- `MODLY_UNIRIG_FLASH_ATTN_WHEEL`
-  - Absolute local wheel path for flash-attn (expert override only; default path is source build with resolved Windows toolchain).
-- `MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL`
-  - Remote wheel URL for flash-attn (expert override only; default path is source build).
-- `MODLY_UNIRIG_ENFORCE_GPU=0`
-  - Allow bootstrap/inference without enforcing CUDA availability.
-- `MODLY_UNIRIG_MIN_VRAM_GB`
-  - Override the minimum VRAM requirement (default: `8`).
+- `MODLY_UNIRIG_RUNTIME_DIR`
+- `MODLY_UNIRIG_REPO_DIR`
 
-## Notes
-
-- The upstream UniRig project currently expects Python 3.11 and a CUDA GPU.
-- The tool intentionally isolates UniRig dependencies from Modly's main runtime.
-- `flash_attn` remains mandatory, but it is installed in a dedicated phase (`--no-build-isolation` for spec installs) instead of the generic `pip install -r requirements.txt`.
-- Intermediate stage FBX files are temporary; the persistent output returned to the workspace is a new rigged `.glb` plus `*.rigmeta.json`.
-
-## Windows/NVIDIA flash-attn flow
-
-- `flash_attn` is required and installed in a dedicated phase after official requirements.
-- On Windows, the extension preflights and resolves: venv `ninja.exe`, Visual Studio Build Tools (`vswhere` + `vcvars64.bat`), and CUDA toolkit (`nvcc`, `CUDA_HOME/CUDA_PATH`, or standard toolkit paths).
-- The default install route follows the official source-build guidance using `--no-build-isolation` inside an environment prepared through `vcvars64.bat` (no manual Developer Prompt required).
+Variables de source build (`MODLY_UNIRIG_FLASH_ATTN_*`, toolchain CUDA/MSVC) son solo para modo `source`.
