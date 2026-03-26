@@ -26,7 +26,7 @@ from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 
 OFFICIAL_UNIRIG_ARCHIVE_URL = 'https://api.github.com/repos/VAST-AI-Research/UniRig/tarball/HEAD'
-BOOTSTRAP_VERSION = 5
+BOOTSTRAP_VERSION = 6
 PYTHON_STANDALONE_VERSION = '3.11.9'
 PYTHON_STANDALONE_RELEASE = '20240726'
 DEFAULT_TORCH_SPEC = 'torch torchvision torchaudio'
@@ -708,6 +708,14 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'flash_attn_version': '',
         'flash_attn_validation_ok': False,
         'flash_attn_last_error': '',
+        'resolved_ninja_path': '',
+        'resolved_vswhere_path': '',
+        'resolved_vcvars_path': '',
+        'resolved_cl_path': '',
+        'resolved_cuda_home': '',
+        'resolved_nvcc_path': '',
+        'resolved_nvcc_version': '',
+        'toolchain_preflight': {},
         'missing_required_modules': [],
         'runpy_smoke_ok': False,
         'last_validation_error': '',
@@ -1621,17 +1629,28 @@ def _install_flash_attn(
     wheel_url = os.environ.get('MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL', '').strip()
     mode = ''
     install_args: list[str]
+    install_command: list[str]
     if local_wheel:
         mode = 'wheel_local'
         install_args = [local_wheel]
+        install_command = _pip_install_command(runtime, install_args)
         _log_bootstrap_event(log_path, 'installing flash-attn', 'start', f'using local wheel override: {local_wheel}')
     elif wheel_url:
         mode = 'wheel_url'
         install_args = [wheel_url]
+        install_command = _pip_install_command(runtime, install_args)
         _log_bootstrap_event(log_path, 'installing flash-attn', 'start', f'using wheel URL override: {wheel_url}')
     else:
-        mode = 'spec_no_build_isolation'
-        _ensure_flash_attn_windows_toolchain(runtime)
+        mode = 'source_no_build_isolation'
+        if platform.system().lower() == 'windows':
+            if progress_cb:
+                progress_cb(min(int(state.get('percent', 0)) + 1, 95), 'preflighting flash-attn')
+            toolchain = _ensure_flash_attn_windows_toolchain(runtime, state, log_path)
+            max_jobs = _safe_int(os.environ.get('MODLY_UNIRIG_MAX_JOBS'), 4)
+            install_command = _windows_flash_attn_install_command(runtime, toolchain, flash_attn_spec, max_jobs=max_jobs)
+        else:
+            _ensure_flash_attn_windows_toolchain(runtime, state, log_path)
+            install_command = _pip_install_command(runtime, [flash_attn_spec, '--no-build-isolation'])
         install_args = [flash_attn_spec, '--no-build-isolation']
         _log_bootstrap_event(
             log_path,
@@ -1645,7 +1664,7 @@ def _install_flash_attn(
             runtime,
             state,
             progress_cb,
-            _pip_install_command(runtime, install_args),
+            install_command,
             cwd=runtime.repo_dir,
             log_path=log_path,
             phase='installing flash-attn',
@@ -1668,35 +1687,275 @@ def _install_flash_attn(
         raise
 
 
-def _ensure_flash_attn_windows_toolchain(runtime: RuntimeContext) -> None:
+def _ensure_flash_attn_windows_toolchain(runtime: RuntimeContext, state: dict | None = None, log_path: Path | None = None) -> dict:
     if platform.system().lower() != 'windows':
-        return
-    script = (
-        'import json, os, shutil; '
-        "payload={'cl': bool(shutil.which('cl.exe')), 'nvcc': bool(shutil.which('nvcc')), "
-        "'ninja': bool(shutil.which('ninja')), 'cuda_env': bool(os.environ.get('CUDA_PATH') or os.environ.get('CUDA_HOME'))}; "
-        'print(json.dumps(payload))'
+        return {}
+    preflight = _preflight_flash_attn_windows_toolchain(runtime)
+    if state is not None:
+        state['toolchain_preflight'] = preflight
+        state['resolved_ninja_path'] = preflight.get('resolved_ninja_path', '')
+        state['resolved_vswhere_path'] = preflight.get('resolved_vswhere_path', '')
+        state['resolved_vcvars_path'] = preflight.get('resolved_vcvars_path', '')
+        state['resolved_cl_path'] = preflight.get('resolved_cl_path', '')
+        state['resolved_cuda_home'] = preflight.get('resolved_cuda_home', '')
+        state['resolved_nvcc_path'] = preflight.get('resolved_nvcc_path', '')
+        state['resolved_nvcc_version'] = preflight.get('resolved_nvcc_version', '')
+        _write_bootstrap_state(runtime, state)
+    if log_path:
+        _log_bootstrap_event(log_path, 'preflighting flash-attn', 'ok', json.dumps(preflight, sort_keys=True))
+    if preflight.get('ok'):
+        return preflight
+    reason = preflight.get('error', '')
+    if reason:
+        raise WorkspaceToolError(reason)
+    raise WorkspaceToolError('flash-attn source install preflight failed on Windows due to unresolved toolchain.')
+
+
+def _preflight_flash_attn_windows_toolchain(runtime: RuntimeContext) -> dict:
+    ninja_path = _resolve_ninja_executable(runtime)
+    vswhere_path, vcvars_path, cl_path = _resolve_msvc_toolchain_paths()
+    cuda_home, cuda_bin, nvcc_path, nvcc_version = _resolve_cuda_toolkit_paths(runtime)
+    toolchain = {
+        'resolved_ninja_path': ninja_path,
+        'resolved_vswhere_path': vswhere_path,
+        'resolved_vcvars_path': vcvars_path,
+        'resolved_cl_path': cl_path,
+        'resolved_cuda_home': cuda_home,
+        'resolved_cuda_bin': cuda_bin,
+        'resolved_nvcc_path': nvcc_path,
+        'resolved_nvcc_version': nvcc_version,
+    }
+    if not ninja_path:
+        toolchain['ok'] = False
+        toolchain['error'] = 'flash-attn requires ninja executable (ninja not found in venv Scripts or PATH).'
+        return toolchain
+    if not vcvars_path:
+        toolchain['ok'] = False
+        if vswhere_path:
+            toolchain['error'] = (
+                'flash-attn requires Visual Studio Build Tools '
+                '(cl.exe not found after vswhere/vcvars resolution)'
+            )
+        else:
+            toolchain['error'] = 'flash-attn requires Visual Studio Build Tools (vswhere/vcvars64.bat not found).'
+        return toolchain
+    if not cuda_home or not nvcc_path:
+        toolchain['ok'] = False
+        toolchain['error'] = (
+            'flash-attn requires CUDA toolkit '
+            '(nvcc.exe not found in CUDA_HOME/CUDA_PATH/standard toolkit locations)'
+        )
+        return toolchain
+    toolchain['ok'] = True
+    return toolchain
+
+
+def _resolve_ninja_executable(runtime: RuntimeContext) -> str:
+    scripts_dir = runtime.venv_dir / 'Scripts'
+    candidates = [scripts_dir / 'ninja.exe']
+    for candidate in candidates:
+        if candidate.exists() and _probe_executable([str(candidate), '--version']):
+            return str(candidate)
+    path_with_venv = os.pathsep.join([str(scripts_dir), os.environ.get('PATH', '')])
+    located = shutil.which('ninja', path=path_with_venv)
+    if located and _probe_executable([located, '--version']):
+        return located
+    fallback = shutil.which('ninja')
+    if fallback and _probe_executable([fallback, '--version']):
+        return fallback
+    return ''
+
+
+def _resolve_msvc_toolchain_paths() -> tuple[str, str, str]:
+    vswhere_path = _resolve_vswhere_path()
+    vcvars_path = ''
+    if vswhere_path:
+        vcvars_path = _resolve_vcvars_from_vswhere(vswhere_path)
+    if not vcvars_path:
+        vcvars_path = _resolve_vcvars_from_standard_paths()
+    cl_path = _resolve_cl_for_vcvars(vcvars_path) if vcvars_path else ''
+    return vswhere_path, vcvars_path, cl_path
+
+
+def _resolve_vswhere_path() -> str:
+    direct = shutil.which('vswhere.exe')
+    if direct:
+        return direct
+    candidates = []
+    for env_name in ('ProgramFiles(x86)', 'ProgramFiles'):
+        root = os.environ.get(env_name, '')
+        if root:
+            candidates.append(Path(root) / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe')
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return ''
+
+
+def _resolve_vcvars_from_vswhere(vswhere_path: str) -> str:
+    try:
+        result = subprocess.run(
+            [
+                vswhere_path,
+                '-latest',
+                '-products',
+                '*',
+                '-requires',
+                'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                '-property',
+                'installationPath',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return ''
+    if result.returncode != 0:
+        return ''
+    install_path = (result.stdout or '').strip().splitlines()
+    if not install_path:
+        return ''
+    vcvars = Path(install_path[-1]) / 'VC' / 'Auxiliary' / 'Build' / 'vcvars64.bat'
+    return str(vcvars) if vcvars.exists() else ''
+
+
+def _resolve_vcvars_from_standard_paths() -> str:
+    roots = []
+    for env_name in ('ProgramFiles(x86)', 'ProgramFiles'):
+        root = os.environ.get(env_name, '')
+        if root:
+            roots.append(Path(root) / 'Microsoft Visual Studio')
+    editions = ('BuildTools', 'Enterprise', 'Professional', 'Community')
+    for root in roots:
+        if not root.exists():
+            continue
+        for year in ('2022', '2019'):
+            for edition in editions:
+                candidate = root / year / edition / 'VC' / 'Auxiliary' / 'Build' / 'vcvars64.bat'
+                if candidate.exists():
+                    return str(candidate)
+    return ''
+
+
+def _resolve_cl_for_vcvars(vcvars_path: str) -> str:
+    vcvars = Path(vcvars_path)
+    if not vcvars.exists():
+        return ''
+    tools_root = vcvars.parent.parent.parent / 'Tools' / 'MSVC'
+    if not tools_root.exists():
+        return ''
+    versions = sorted([p for p in tools_root.glob('*') if p.is_dir()], reverse=True)
+    for version_dir in versions:
+        cl_candidate = version_dir / 'bin' / 'Hostx64' / 'x64' / 'cl.exe'
+        if cl_candidate.exists():
+            return str(cl_candidate)
+    return ''
+
+
+def _resolve_cuda_toolkit_paths(runtime: RuntimeContext) -> tuple[str, str, str, str]:
+    preferred = _preferred_cuda_versions_from_profile(runtime)
+    env_candidates = [os.environ.get('CUDA_HOME', '').strip(), os.environ.get('CUDA_PATH', '').strip()]
+    for value in env_candidates:
+        if not value:
+            continue
+        resolved = _validate_cuda_home(Path(value))
+        if resolved:
+            return resolved
+    for cuda_home in _iter_standard_cuda_homes(preferred):
+        resolved = _validate_cuda_home(cuda_home)
+        if resolved:
+            return resolved
+    return '', '', '', ''
+
+
+def _preferred_cuda_versions_from_profile(runtime: RuntimeContext) -> list[str]:
+    try:
+        profile, _meta = resolve_runtime_profile(runtime)
+    except Exception:
+        return []
+    flavor = profile.cuda_flavor.lower().strip()
+    if flavor.startswith('cu') and len(flavor) == 5 and flavor[2:].isdigit():
+        major = flavor[2]
+        minor = flavor[3:]
+        return [f'{major}.{minor}']
+    return []
+
+
+def _iter_standard_cuda_homes(preferred_versions: Sequence[str]) -> list[Path]:
+    base = Path(r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA')
+    if not base.exists():
+        return []
+    candidates = [p for p in base.glob('v*') if p.is_dir()]
+    preferred = set(preferred_versions)
+    scored = []
+    for path in candidates:
+        version_text = path.name[1:]
+        score = 1 if version_text in preferred else 0
+        scored.append((score, version_text, path))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item[2] for item in scored]
+
+
+def _validate_cuda_home(cuda_home: Path) -> tuple[str, str, str, str] | None:
+    bin_dir = cuda_home / 'bin'
+    nvcc_path = bin_dir / 'nvcc.exe'
+    if not nvcc_path.exists():
+        return None
+    if not _probe_executable([str(nvcc_path), '--version']):
+        return None
+    nvcc_version = _read_nvcc_version(str(nvcc_path))
+    return str(cuda_home), str(bin_dir), str(nvcc_path), nvcc_version
+
+
+def _read_nvcc_version(nvcc_path: str) -> str:
+    try:
+        result = subprocess.run([nvcc_path, '--version'], capture_output=True, text=True, check=False)
+    except Exception:
+        return ''
+    output = (result.stdout or '') + '\n' + (result.stderr or '')
+    for line in output.splitlines():
+        if 'release ' in line:
+            marker = line.split('release ', 1)[1].strip()
+            return marker.split(',', 1)[0].strip()
+    return ''
+
+
+def _probe_executable(command: Sequence[str]) -> bool:
+    try:
+        result = subprocess.run(list(command), capture_output=True, text=True, check=False)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _windows_flash_attn_install_command(
+    runtime: RuntimeContext,
+    toolchain: dict,
+    flash_attn_spec: str,
+    max_jobs: int,
+) -> list[str]:
+    python_exe = str(runtime.python_exe)
+    venv_scripts = str(runtime.venv_dir / 'Scripts')
+    cuda_home = str(toolchain.get('resolved_cuda_home', ''))
+    cuda_bin = str(toolchain.get('resolved_cuda_bin', ''))
+    vcvars = str(toolchain.get('resolved_vcvars_path', ''))
+    ninja_path = str(toolchain.get('resolved_ninja_path', ''))
+    max_jobs = max(1, max_jobs)
+    cmd_parts = [
+        f'call "{vcvars}"',
+        f'set "CUDA_HOME={cuda_home}"',
+        f'set "CUDA_PATH={cuda_home}"',
+        f'set "PATH={venv_scripts};{cuda_bin};%PATH%"',
+        f'set "MAX_JOBS={max_jobs}"',
+    ]
+    if ninja_path:
+        cmd_parts.append(f'set "CMAKE_MAKE_PROGRAM={ninja_path}"')
+    cmd_parts.append(
+        f'"{python_exe}" -m pip install --disable-pip-version-check --no-input --no-cache-dir --no-build-isolation {flash_attn_spec}'
     )
-    output = _run_capture([str(runtime.python_exe), '-c', script], cwd=runtime.repo_dir)
-    payload = _parse_last_json_line(output, 'Failed flash-attn Windows toolchain preflight')
-    has_cl = bool(payload.get('cl'))
-    has_nvcc = bool(payload.get('nvcc'))
-    has_ninja = bool(payload.get('ninja'))
-    has_cuda_env = bool(payload.get('cuda_env'))
-    if has_cl and has_ninja and (has_nvcc or has_cuda_env):
-        return
-    missing: list[str] = []
-    if not has_cl:
-        missing.append('cl.exe (MSVC build tools)')
-    if not has_ninja:
-        missing.append('ninja executable')
-    if not (has_nvcc or has_cuda_env):
-        missing.append('CUDA toolkit (nvcc or CUDA_PATH/CUDA_HOME)')
-    raise WorkspaceToolError(
-        'flash-attn source install preflight failed on Windows. Missing toolchain prerequisites: '
-        + ', '.join(missing)
-        + '. Provide MODLY_UNIRIG_FLASH_ATTN_WHEEL or MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL to use a prebuilt wheel.'
-    )
+    cmd_script = ' && '.join(cmd_parts)
+    return ['cmd.exe', '/d', '/s', '/c', cmd_script]
 
 
 def _query_flash_attn_version(runtime: RuntimeContext) -> str:

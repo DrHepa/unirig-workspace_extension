@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.6 - 2026-03-26
+
+### Resumen
+- Se reforzó el preflight obligatorio de `flash_attn` en Windows/NVIDIA con resolución real de toolchain: `ninja.exe` desde venv `Scripts`, Visual Studio Build Tools (`vswhere` + `vcvars64.bat` + `cl.exe` esperado) y CUDA toolkit (`CUDA_HOME`/`CUDA_PATH`/rutas estándar).
+- La ruta por defecto de `flash_attn` en `win-cu128-stable` queda fijada a `flash_attn==2.7.4.post1` y se instala como source build con `--no-build-isolation` dentro de un `cmd.exe` preparado por `vcvars64.bat`.
+- Se ampliaron estado y logs del bootstrap con trazabilidad de toolchain (`resolved_*`, `toolchain_preflight`, validación de flash-attn) y fase explícita `preflighting flash-attn`.
+- Se mantuvo la secuencia oficial separando `installing official UniRig requirements` (sin `flash_attn`) de `installing flash-attn` obligatoria.
+- Se añadieron tests para resolución de `ninja`, `vcvars` vía `vswhere`, resolución de CUDA por env/rutas estándar, comando final de flash-attn y reparación resumable centrada en `flash_attn`.
+
+### Archivos cambiados
+- `generator.py`
+- `tests/test_runtime_lifecycle.py`
+- `README.md`
+- `manifest.json`
+- `CHANGELOG.md`
+
 ## 0.1.5 - 2026-03-26
 
 ### Resumen
