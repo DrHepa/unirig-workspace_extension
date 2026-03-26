@@ -234,6 +234,66 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 self.assertGreaterEqual(saved['percent'], 100)
                 self.assertTrue(progress)
 
+    def test_download_repo_phase_is_reported_before_network_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                observed_steps: list[str] = []
+
+                def phase_cb(_percent: int, step: str) -> None:
+                    observed_steps.append(step)
+
+                def fake_download(_url: str, _destination: Path, heartbeat_cb=None) -> None:
+                    self.assertEqual(observed_steps, ['downloading UniRig repo'])
+                    if heartbeat_cb:
+                        heartbeat_cb()
+
+                def fake_extract(_archive: Path, destination: Path, heartbeat_cb=None) -> None:
+                    extracted_repo = destination / 'unirig-main'
+                    extracted_repo.mkdir(parents=True, exist_ok=True)
+                    (extracted_repo / 'run.py').write_text('# stub', encoding='utf-8')
+                    if heartbeat_cb:
+                        heartbeat_cb()
+
+                with patch('generator._download_file', side_effect=fake_download), patch(
+                    'generator._extract_archive',
+                    side_effect=fake_extract,
+                ):
+                    generator._download_unirig_repo(runtime, phase_cb=phase_cb)
+
+                self.assertEqual(observed_steps[:2], ['downloading UniRig repo', 'extracting UniRig repo'])
+                self.assertTrue((runtime.repo_dir / 'run.py').exists())
+
+    def test_download_repo_forwards_heartbeat_to_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                heartbeat_calls = {'count': 0}
+
+                def heartbeat() -> None:
+                    heartbeat_calls['count'] += 1
+
+                def fake_download(_url: str, destination: Path, heartbeat_cb=None) -> None:
+                    destination.write_bytes(b'dummy')
+                    if heartbeat_cb:
+                        heartbeat_cb()
+
+                def fake_extract(_archive: Path, destination: Path, heartbeat_cb=None) -> None:
+                    self.assertIsNotNone(heartbeat_cb)
+                    if heartbeat_cb:
+                        heartbeat_cb()
+                    extracted_repo = destination / 'unirig-main'
+                    extracted_repo.mkdir(parents=True, exist_ok=True)
+                    (extracted_repo / 'run.py').write_text('# stub', encoding='utf-8')
+
+                with patch('generator._download_file', side_effect=fake_download), patch(
+                    'generator._extract_archive',
+                    side_effect=fake_extract,
+                ):
+                    generator._download_unirig_repo(runtime, heartbeat_cb=heartbeat)
+
+                self.assertGreaterEqual(heartbeat_calls['count'], 2)
+
 
 if __name__ == '__main__':
     unittest.main()
