@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.5 - 2026-03-26
+
+### Resumen
+- Se separó `flash_attn` del `pip install -r requirements.txt` genérico: ahora el bootstrap instala el requirements oficial filtrado (excluyendo solo `flash_attn`) y luego ejecuta una fase dedicada obligatoria `installing flash-attn`.
+- Se añadió instalador dedicado de `flash_attn` con prerequisitos (`packaging`, `psutil`, `ninja`) y modo por spec con `--no-build-isolation`.
+- El perfil `win-cu128-stable` ahora fija explícitamente `flash_attn==2.7.4.post1` (override experto: `MODLY_UNIRIG_FLASH_ATTN_SPEC`).
+- Se añadieron overrides expertos para wheel local/remota (`MODLY_UNIRIG_FLASH_ATTN_WHEEL`, `MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL`) con orden de resolución local > URL > spec.
+- Se incorporó preflight de toolchain en Windows antes de source install (MSVC `cl.exe`, entorno CUDA `nvcc`/`CUDA_PATH`, `ninja`) y error accionable cuando falta.
+- Se mejoró el runtime resumable/repair: si solo falta `flash_attn`, reanuda en la fase dedicada sin reinstalar baseline completo.
+- Se amplió `bootstrap_state.json` con estado persistido de `flash_attn` (requerido, spec, modo, versión, validación y último error).
+- La validación final exige `import flash_attn` y mantiene `run.py --help`.
+
+### Archivos cambiados
+- `generator.py`
+- `tests/test_runtime_lifecycle.py`
+- `README.md`
+- `manifest.json`
+- `CHANGELOG.md`
+
 ## 0.1.3 - 2026-03-26
 
 ### Resumen

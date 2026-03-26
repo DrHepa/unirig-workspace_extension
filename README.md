@@ -41,15 +41,20 @@ Useful overrides when packaging or debugging:
   - Override the spconv package name (default: `spconv-cu120`).
 - `MODLY_UNIRIG_PYG_WHEEL_URL`
   - Override the PyG wheel index URL for `torch_scatter` / `torch_cluster`.
+- `MODLY_UNIRIG_FLASH_ATTN_SPEC`
+  - Override the pinned flash-attn spec used by the dedicated install phase (default profile pin: `flash_attn==2.7.4.post1`).
+- `MODLY_UNIRIG_FLASH_ATTN_WHEEL`
+  - Absolute local wheel path for flash-attn; takes precedence over spec/source install.
+- `MODLY_UNIRIG_FLASH_ATTN_WHEEL_URL`
+  - Remote wheel URL for flash-attn; used when local wheel override is not set.
 - `MODLY_UNIRIG_ENFORCE_GPU=0`
   - Allow bootstrap/inference without enforcing CUDA availability.
 - `MODLY_UNIRIG_MIN_VRAM_GB`
   - Override the minimum VRAM requirement (default: `8`).
-- `MODLY_UNIRIG_ENABLE_FLASH_ATTN=1`
-  - Keep `flash_attn` from upstream requirements instead of filtering it out during bootstrap.
 
 ## Notes
 
 - The upstream UniRig project currently expects Python 3.11 and a CUDA GPU.
 - The tool intentionally isolates UniRig dependencies from Modly's main runtime.
+- `flash_attn` remains mandatory, but it is installed in a dedicated phase (`--no-build-isolation` for spec installs) instead of the generic `pip install -r requirements.txt`.
 - Intermediate stage FBX files are temporary; the persistent output returned to the workspace is a new rigged `.glb` plus `*.rigmeta.json`.
