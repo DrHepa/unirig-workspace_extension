@@ -1513,21 +1513,64 @@ def _install_official_requirements(
         _write_bootstrap_state(runtime, state)
         _log_bootstrap_event(log_path, 'installing official UniRig requirements', 'ok', 'skipped: marker exists')
         return
-    command = _pip_install_command(runtime, ['-r', str(requirements_path)])
-    _run_subprocess_with_heartbeat(
-        runtime,
-        state,
-        progress_cb,
-        command,
-        cwd=runtime.repo_dir,
-        log_path=log_path,
-        phase='installing official UniRig requirements',
-        timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
-    )
+    install_requirements_path, filtered_flash_attn = _resolve_official_requirements_install_path(runtime, requirements_path)
+    if filtered_flash_attn:
+        _log_bootstrap_event(
+            log_path,
+            'installing official UniRig requirements',
+            'start',
+            'filtered flash_attn requirement (set MODLY_UNIRIG_ENABLE_FLASH_ATTN=1 to keep it)',
+        )
+    command = _pip_install_command(runtime, ['-r', str(install_requirements_path)])
+    try:
+        _run_subprocess_with_heartbeat(
+            runtime,
+            state,
+            progress_cb,
+            command,
+            cwd=runtime.repo_dir,
+            log_path=log_path,
+            phase='installing official UniRig requirements',
+            timeout_sec=PHASE_TIMEOUTS_SEC['installing official requirements'],
+        )
+    finally:
+        if filtered_flash_attn:
+            install_requirements_path.unlink(missing_ok=True)
     _mark_phase(runtime, 'official_requirements')
     _complete_phase(state, 'official_requirements')
     state['required_baseline_installed'] = True
     _write_bootstrap_state(runtime, state)
+
+
+def _resolve_official_requirements_install_path(runtime: RuntimeContext, requirements_path: Path) -> tuple[Path, bool]:
+    if _env_truthy('MODLY_UNIRIG_ENABLE_FLASH_ATTN', False):
+        return requirements_path, False
+    lines = requirements_path.read_text(encoding='utf-8').splitlines()
+    filtered_lines: list[str] = []
+    filtered = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            filtered_lines.append(line)
+            continue
+        normalized = stripped.lower()
+        if re.match(r'^flash[-_]?attn(\[.*\])?([<>=!~].*)?$', normalized):
+            filtered = True
+            continue
+        filtered_lines.append(line)
+    if not filtered:
+        return requirements_path, False
+    runtime.runtime_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        encoding='utf-8',
+        dir=runtime.runtime_root,
+        prefix='requirements_no_flash_attn_',
+        suffix='.txt',
+        delete=False,
+    ) as handle:
+        handle.write('\n'.join(filtered_lines) + '\n')
+    return Path(handle.name), True
 
 
 def _install_spconv_and_pyg(
