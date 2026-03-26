@@ -23,6 +23,7 @@ FLASH_ATTN_WHEEL_DEFAULT = (
     'https://huggingface.co/lldacing/flash-attention-windows-wheel/resolve/main/'
     'flash_attn-2.7.4.post1+cu128torch2.7.0cxx11abiFALSE-cp311-cp311-win_amd64.whl'
 )
+TRITON_WINDOWS_PACKAGE_DEFAULT = 'triton-windows==3.3.1.post19'
 
 TORCH_PACKAGES = ['torch==2.7.0', 'torchvision==0.22.0', 'torchaudio==2.7.0']
 SPCONV_PACKAGE = 'spconv-cu120'
@@ -57,7 +58,19 @@ REQUIRED_IMPORTS: list[str] = [
     'torch_cluster',
     'spconv',
     'flash_attn',
+    'triton',
 ]
+
+DEEP_IMPORT_CHECKS: dict[str, str] = {
+    'flash_attn.layers.rotary': 'from flash_attn.layers.rotary import apply_rotary_emb',
+    'transformers.models.opt.modeling_opt': 'import importlib; importlib.import_module("transformers.models.opt.modeling_opt")',
+}
+
+RUNTIME_ENV_DEFAULTS: dict[str, str] = {
+    'HF_HUB_DISABLE_SYMLINKS_WARNING': '1',
+    'TRANSFORMERS_NO_ADVISORY_WARNINGS': '1',
+    'HF_HUB_DISABLE_TELEMETRY': '1',
+}
 
 
 @dataclass
@@ -124,6 +137,10 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _run(pip + ['install', '--index-url', TORCH_INDEX_URL, *TORCH_PACKAGES], cwd=runtime.unirig_dir)
             _update_state(runtime, state, 40, 'torch installed')
 
+            _report(progress_cb, 48, 'installing triton runtime')
+            _install_triton(runtime)
+            _update_state(runtime, state, 48, 'triton installed')
+
             _report(progress_cb, 55, 'installing UniRig requirements')
             _install_official_requirements_excluding_flash_attn(runtime)
             _update_state(runtime, state, 55, 'requirements installed')
@@ -148,7 +165,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _report(progress_cb, 94, 'validating imports')
             missing = _missing_imports(runtime, py_path)
             if missing:
-                raise WorkspaceToolError(f'missing imports: {", ".join(missing)}')
+                raise WorkspaceToolError('missing imports: ' + '; '.join(missing))
 
             _report(progress_cb, 97, 'validating run.py --help')
             _run([str(runtime.python_exe), 'run.py', '--help'], cwd=runtime.unirig_dir, extra_env={'PYTHONPATH': py_path})
@@ -181,6 +198,11 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         if status.get('install_state') != 'ready' or not _runtime_ready(runtime):
             raise WorkspaceToolError('UniRig runtime is not ready. Install runtime first.')
 
+        py_path = _vendor_pythonpath(runtime)
+        missing = _ensure_runtime_dependencies(runtime, py_path)
+        if missing:
+            raise WorkspaceToolError('UniRig runtime is missing dependencies. Run Repair runtime. Missing: ' + '; '.join(missing))
+
         suffix = input_path.suffix.lower()
         if suffix not in SUPPORTED_SUFFIXES:
             raise WorkspaceToolError(f'Unsupported mesh format: {suffix}')
@@ -189,7 +211,6 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         output_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
         output_path = output_dir / f'{input_path.stem}_unirig_{ts}.glb'
-        py_path = _vendor_pythonpath(runtime)
 
         with tempfile.TemporaryDirectory(prefix='unirig_stage_') as tmp:
             stage_root = Path(tmp)
@@ -457,6 +478,17 @@ def _create_venv(runtime: RuntimeContext) -> None:
     _run([*py311_cmd, '-m', 'venv', str(runtime.venv_dir)], cwd=runtime.runtime_root)
 
 
+def _triton_package() -> str:
+    raw = os.environ.get('MODLY_UNIRIG_TRITON_PACKAGE', TRITON_WINDOWS_PACKAGE_DEFAULT).strip()
+    return raw or TRITON_WINDOWS_PACKAGE_DEFAULT
+
+
+def _install_triton(runtime: RuntimeContext) -> None:
+    if os.name != 'nt':
+        return
+    _run([str(runtime.python_exe), '-m', 'pip', 'install', _triton_package()], cwd=runtime.unirig_dir)
+
+
 def _install_official_requirements_excluding_flash_attn(runtime: RuntimeContext) -> None:
     req_path = runtime.unirig_dir / 'requirements.txt'
     if not req_path.exists():
@@ -494,20 +526,41 @@ def _append_log(runtime: RuntimeContext, filename: str, detail: str) -> None:
 
 
 def _missing_imports(runtime: RuntimeContext, py_path: str) -> list[str]:
+    checks: list[tuple[str, str]] = []
+    for module_name in REQUIRED_IMPORTS:
+        checks.append((module_name, f'import importlib; importlib.import_module("{module_name}")'))
+    checks.extend(DEEP_IMPORT_CHECKS.items())
+
     code = (
-        'import importlib, json\n'
-        f'mods={REQUIRED_IMPORTS!r}\n'
-        'missing=[]\n'
-        'for m in mods:\n'
+        'import json\n'
+        f'checks={checks!r}\n'
+        'failed=[]\n'
+        'for label, stmt in checks:\n'
         '  try:\n'
-        '    importlib.import_module(m)\n'
-        '  except Exception:\n'
-        '    missing.append(m)\n'
-        'print(json.dumps({"missing":missing}))\n'
+        '    exec(stmt, {})\n'
+        '  except Exception as exc:\n'
+        '    failed.append({"check": label, "error": str(exc)})\n'
+        'print(json.dumps({"failed": failed}))\n'
     )
     output = _run_capture([str(runtime.python_exe), '-c', code], extra_env={'PYTHONPATH': py_path})
     payload = json.loads(output.strip().splitlines()[-1])
-    return payload.get('missing', [])
+    return [f"{item['check']}: {item['error']}" for item in payload.get('failed', [])]
+
+
+def _ensure_runtime_dependencies(runtime: RuntimeContext, py_path: str) -> list[str]:
+    missing = _missing_imports(runtime, py_path)
+    if not missing:
+        return []
+    recoverable = any(
+        entry.startswith('triton:')
+        or entry.startswith('flash_attn.layers.rotary:')
+        or entry.startswith('transformers.models.opt.modeling_opt:')
+        for entry in missing
+    )
+    if os.name == 'nt' and recoverable:
+        _install_triton(runtime)
+        missing = _missing_imports(runtime, py_path)
+    return missing
 
 
 def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
@@ -527,10 +580,17 @@ def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
     return converted_path
 
 
-def _run(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
+def _compose_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
+    for key, value in RUNTIME_ENV_DEFAULTS.items():
+        env.setdefault(key, value)
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def _run(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
+    env = _compose_env(extra_env)
     result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout or '').strip().splitlines()[-60:]
@@ -538,9 +598,7 @@ def _run(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] 
 
 
 def _run_capture(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> str:
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
+    env = _compose_env(extra_env)
     result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout or '').strip().splitlines()[-60:]

@@ -1,8 +1,8 @@
 {
   "id": "unirig-workspace-v1",
   "name": "UniRig Workspace Tool",
-  "description": "Vendored UniRig workspace tool with auto-built source vendor and binary runtime installation.",
-  "version": "0.6.1",
+  "description": "Vendored UniRig workspace tool with Triton runtime self-heal for flash-attn on Windows.",
+  "version": "0.6.2",
   "author": "DrHepa",
   "extension_type": "workspace_tool",
   "workspace_tool_class": "UniRigWorkspaceTool",
