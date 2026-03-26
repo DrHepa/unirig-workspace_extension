@@ -140,6 +140,37 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 self.assertIn('--progress-bar', cmd)
                 self.assertIn('off', cmd)
 
+    def test_resolve_official_requirements_filters_flash_attn_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                requirements = runtime.repo_dir / 'requirements.txt'
+                requirements.write_text('numpy==1.26.4\nflash_attn==2.6.3\ntorch==2.6.0\n', encoding='utf-8')
+                install_path, filtered = generator._resolve_official_requirements_install_path(runtime, requirements)
+                self.assertTrue(filtered)
+                self.assertNotEqual(install_path, requirements)
+                self.assertTrue(install_path.exists())
+                content = install_path.read_text(encoding='utf-8')
+                self.assertIn('numpy==1.26.4', content)
+                self.assertIn('torch==2.6.0', content)
+                self.assertNotIn('flash_attn==2.6.3', content)
+
+    def test_resolve_official_requirements_keeps_flash_attn_with_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {'MODLY_UNIRIG_RUNTIME_DIR': tmp, 'MODLY_UNIRIG_ENABLE_FLASH_ATTN': '1'},
+                clear=False,
+            ):
+                runtime = generator._resolve_runtime_context()
+                runtime.repo_dir.mkdir(parents=True, exist_ok=True)
+                requirements = runtime.repo_dir / 'requirements.txt'
+                requirements.write_text('numpy==1.26.4\nflash-attn==2.6.3\n', encoding='utf-8')
+                install_path, filtered = generator._resolve_official_requirements_install_path(runtime, requirements)
+                self.assertFalse(filtered)
+                self.assertEqual(install_path, requirements)
+
     def test_repair_runtime_stack_skips_uninstall_when_no_packages_detected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': tmp}, clear=False):
