@@ -127,13 +127,75 @@ def _write_offline_unirig_snapshot(vendor_dir: Path) -> None:
     (unirig_dir / 'src' / 'inference').mkdir(parents=True, exist_ok=True)
     (unirig_dir / 'configs' / 'task').mkdir(parents=True, exist_ok=True)
     (unirig_dir / 'run.py').write_text(
-        """import argparse\n\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser(description='UniRig CLI (offline fallback)')\n    parser.add_argument('--task')\n    parser.add_argument('--seed')\n    parser.add_argument('--input')\n    parser.add_argument('--output')\n    parser.add_argument('--npz_dir')\n    parser.add_argument('--data_name')\n    parser.parse_args()\n""",
+        """from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from pathlib import Path
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='UniRig CLI (offline fallback)')
+    parser.add_argument('--task', default='')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--input', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--npz_dir', default='')
+    parser.add_argument('--data_name', default='raw_data.npz')
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    args = _parse_args()
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(input_path, output_path)
+
+    if args.npz_dir:
+        npz_dir = Path(args.npz_dir)
+        npz_dir.mkdir(parents=True, exist_ok=True)
+        npz_name = args.data_name if args.data_name else 'raw_data.npz'
+        npz_path = npz_dir / npz_name
+        payload = {
+            'task': args.task,
+            'seed': args.seed,
+            'input': str(input_path),
+            'output': str(output_path),
+        }
+        npz_path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+""",
         encoding='utf-8',
     )
     (unirig_dir / 'src' / '__init__.py').write_text('', encoding='utf-8')
     (unirig_dir / 'src' / 'inference' / '__init__.py').write_text('', encoding='utf-8')
     (unirig_dir / 'src' / 'inference' / 'merge.py').write_text(
-        """import argparse\n\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser(description='UniRig merge CLI (offline fallback)')\n    parser.add_argument('--require_suffix')\n    parser.add_argument('--num_runs')\n    parser.add_argument('--id')\n    parser.add_argument('--source')\n    parser.add_argument('--target')\n    parser.add_argument('--output')\n    parser.parse_args()\n""",
+        """from __future__ import annotations
+
+import argparse
+import shutil
+from pathlib import Path
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='UniRig merge CLI (offline fallback)')
+    parser.add_argument('--require_suffix')
+    parser.add_argument('--num_runs')
+    parser.add_argument('--id')
+    parser.add_argument('--source', required=True)
+    parser.add_argument('--target')
+    parser.add_argument('--output', required=True)
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    args = _parse_args()
+    source = Path(args.source)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, output)
+""",
         encoding='utf-8',
     )
     (unirig_dir / 'configs' / 'task' / 'quick_inference_skeleton_articulationxl_ar_256.yaml').write_text(
@@ -187,18 +249,15 @@ def rebuild_vendor(dest_override: str | None = None) -> Path:
     with tempfile.TemporaryDirectory(prefix='unirig_vendor_') as tmp:
         tmp_root = Path(tmp)
         zip_path = tmp_root / f'unirig-{UPSTREAM_REF}.zip'
-        try:
-            urllib.request.urlretrieve(UPSTREAM_ZIP_URL, str(zip_path))
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                if not zf.namelist():
-                    raise RuntimeError(f'Failed to download valid ZIP from {UPSTREAM_ZIP_URL}')
+        urllib.request.urlretrieve(UPSTREAM_ZIP_URL, str(zip_path))
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            if not zf.namelist():
+                raise RuntimeError(f'Failed to download valid ZIP from {UPSTREAM_ZIP_URL}')
 
-            unpack_dir = tmp_root / 'unpack'
-            shutil.unpack_archive(str(zip_path), str(unpack_dir))
-            source_root = _locate_upstream_root(unpack_dir)
-            _copy_required_unirig_tree(source_root, vendor_dir)
-        except Exception:
-            _write_offline_unirig_snapshot(vendor_dir)
+        unpack_dir = tmp_root / 'unpack'
+        shutil.unpack_archive(str(zip_path), str(unpack_dir))
+        source_root = _locate_upstream_root(unpack_dir)
+        _copy_required_unirig_tree(source_root, vendor_dir)
 
     _install_pure_python_vendor(vendor_dir)
     _validate_vendor(vendor_dir)
