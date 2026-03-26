@@ -16,9 +16,12 @@ import trimesh
 from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 TOOL_ID = 'unirig-workspace-v1'
-BOOTSTRAP_VERSION = 8
-OFFICIAL_UNIRIG_REPO_URL = 'https://github.com/VAST-AI-Research/UniRig.git'
+BOOTSTRAP_VERSION = 9
+OFFICIAL_UNIRIG_REPO = 'VAST-AI-Research/UniRig'
 OFFICIAL_UNIRIG_REF = os.environ.get('MODLY_UNIRIG_REPO_REF', 'main')
+OFFICIAL_UNIRIG_ZIP_URL = (
+    'https://github.com/' + OFFICIAL_UNIRIG_REPO + '/archive/' + OFFICIAL_UNIRIG_REF + '.zip'
+)
 
 TORCH_INDEX_URL = 'https://download.pytorch.org/whl/cu128'
 PYG_INDEX_URL = 'https://data.pyg.org/whl/torch-2.7.0+cu128.html'
@@ -217,10 +220,11 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 [
                     str(runtime.python_exe),
                     'run.py',
-                    f'--config-name={SKELETON_TASK}',
-                    f'--target={prepared}',
-                    f'--save_dir={skeleton_output}',
-                    f'seed={seed}',
+                    f'--task={SKELETON_TASK}',
+                    f'--seed={seed}',
+                    f'--input={prepared}',
+                    f'--output={skeleton_output}',
+                    f'--npz_dir={skeleton_npz_dir}',
                 ],
                 cwd=runtime.repo_dir,
             )
@@ -232,11 +236,12 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                 [
                     str(runtime.python_exe),
                     'run.py',
-                    f'--config-name={SKIN_TASK}',
-                    f'--target={skeleton_output}',
-                    f'--save_dir={skin_output}',
-                    f'skin_npz_name={SKIN_DATA_NAME}',
-                    f'seed={seed}',
+                    f'--task={SKIN_TASK}',
+                    f'--seed={seed}',
+                    f'--input={skeleton_output}',
+                    f'--output={skin_output}',
+                    f'--npz_dir={skin_npz_dir}',
+                    f'--data_name={SKIN_DATA_NAME}',
                 ],
                 cwd=runtime.repo_dir,
             )
@@ -247,11 +252,14 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _run(
                 [
                     str(runtime.python_exe),
-                    'evaluation/merge.py',
-                    f'--pred={skin_output}',
+                    '-m',
+                    'src.inference.merge',
+                    f'--require_suffix={MERGE_REQUIRE_SUFFIX}',
+                    '--num_runs=1',
+                    '--id=0',
+                    f'--source={skin_output}',
                     f'--target={prepared}',
                     f'--output={output_path}',
-                    f'--require={MERGE_REQUIRE_SUFFIX}',
                 ],
                 cwd=runtime.repo_dir,
             )
@@ -333,22 +341,70 @@ def _runtime_ready(runtime: RuntimeContext) -> bool:
 
 
 def _prepare_repo(runtime: RuntimeContext) -> None:
-    repo_url = os.environ.get('MODLY_UNIRIG_REPO_URL', OFFICIAL_UNIRIG_REPO_URL)
-    if runtime.repo_dir.exists() and (runtime.repo_dir / '.git').exists():
-        _run(['git', 'fetch', '--depth', '1', 'origin', OFFICIAL_UNIRIG_REF], cwd=runtime.repo_dir)
-        _run(['git', 'checkout', OFFICIAL_UNIRIG_REF], cwd=runtime.repo_dir)
-        _run(['git', 'reset', '--hard', f'origin/{OFFICIAL_UNIRIG_REF}'], cwd=runtime.repo_dir)
-        return
+    zip_url = os.environ.get('MODLY_UNIRIG_ZIP_URL', OFFICIAL_UNIRIG_ZIP_URL)
+    cache_dir = runtime.runtime_root / 'cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     if runtime.repo_dir.exists():
         shutil.rmtree(runtime.repo_dir, ignore_errors=True)
-    _run(['git', 'clone', '--depth', '1', '--branch', OFFICIAL_UNIRIG_REF, repo_url, str(runtime.repo_dir)], cwd=runtime.runtime_root)
+
+    zip_name = f'unirig-{OFFICIAL_UNIRIG_REF}.zip'
+    zip_path = cache_dir / zip_name
+    if not zip_path.exists():
+        urllib.request.urlretrieve(zip_url, str(zip_path))
+
+    unpack_root = runtime.runtime_root / 'repo_unpack'
+    if unpack_root.exists():
+        shutil.rmtree(unpack_root, ignore_errors=True)
+    shutil.unpack_archive(str(zip_path), str(unpack_root))
+
+    candidates = [p for p in unpack_root.iterdir() if p.is_dir()]
+    if not candidates:
+        raise WorkspaceToolError('Downloaded UniRig zip did not contain a repository directory')
+    extracted_repo = candidates[0]
+    shutil.move(str(extracted_repo), str(runtime.repo_dir))
+    shutil.rmtree(unpack_root, ignore_errors=True)
+
+
+def _resolve_python311_cmd() -> list[str]:
+    env_bin = os.environ.get('MODLY_UNIRIG_PYTHON311_BIN', '').strip()
+    if env_bin:
+        return [env_bin]
+
+    bundled_env = [
+        'MODLY_BUNDLED_PYTHON311_BIN',
+        'MODLY_EMBEDDED_PYTHON311_BIN',
+    ]
+    for key in bundled_env:
+        value = os.environ.get(key, '').strip()
+        if value:
+            return [value]
+
+    bundled_candidates = []
+    if os.name == 'nt':
+        bundled_candidates.extend([
+            Path(os.environ.get('MODLY_APP_DIR', '')) / 'python' / 'python.exe',
+            Path(os.environ.get('MODLY_HOME', '')) / 'python' / 'python.exe',
+        ])
+    for candidate in bundled_candidates:
+        if str(candidate) and candidate.exists():
+            return [str(candidate)]
+
+    if shutil.which('py'):
+        return ['py', '-3.11']
+    if shutil.which('python3.11'):
+        return ['python3.11']
+
+    raise WorkspaceToolError(
+        'Python 3.11 not found. Set MODLY_UNIRIG_PYTHON311_BIN or install Python 3.11.'
+    )
 
 
 def _create_venv(runtime: RuntimeContext) -> None:
     if runtime.python_exe.exists():
         return
-    py311 = os.environ.get('MODLY_UNIRIG_PYTHON311_BIN', 'python3.11')
-    _run([py311, '-m', 'venv', str(runtime.venv_dir)], cwd=runtime.runtime_root)
+    py311_cmd = _resolve_python311_cmd()
+    _run([*py311_cmd, '-m', 'venv', str(runtime.venv_dir)], cwd=runtime.runtime_root)
 
 
 def _install_requirements_excluding_flash_attn(runtime: RuntimeContext) -> None:
@@ -381,9 +437,6 @@ def _install_flash_attn(runtime: RuntimeContext) -> None:
             urllib.request.urlretrieve(wheel_url, str(wheel_path))
         _run([str(runtime.python_exe), '-m', 'pip', 'install', str(wheel_path)], cwd=runtime.repo_dir)
     except Exception as exc:
-        if os.environ.get('MODLY_UNIRIG_ALLOW_SOURCE_FLASH_ATTN') == '1':
-            _run([str(runtime.python_exe), '-m', 'pip', 'install', 'flash-attn', '--no-build-isolation'], cwd=runtime.repo_dir)
-            return
         _append_flash_log(runtime, f'wheel_url={wheel_url}\nerror={exc}')
         raise WorkspaceToolError('flash-attn wheel install failed') from exc
 
