@@ -11,17 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-import trimesh
-
 from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 TOOL_ID = 'unirig-workspace-v1'
-BOOTSTRAP_VERSION = 9
-OFFICIAL_UNIRIG_REPO = 'VAST-AI-Research/UniRig'
-OFFICIAL_UNIRIG_REF = os.environ.get('MODLY_UNIRIG_REPO_REF', 'main')
-OFFICIAL_UNIRIG_ZIP_URL = (
-    'https://github.com/' + OFFICIAL_UNIRIG_REPO + '/archive/' + OFFICIAL_UNIRIG_REF + '.zip'
-)
+BOOTSTRAP_VERSION = 10
 
 TORCH_INDEX_URL = 'https://download.pytorch.org/whl/cu128'
 PYG_INDEX_URL = 'https://data.pyg.org/whl/torch-2.7.0+cu128.html'
@@ -30,15 +23,9 @@ FLASH_ATTN_WHEEL_DEFAULT = (
     'flash_attn-2.7.4.post1+cu128torch2.7.0cxx11abiFALSE-cp311-cp311-win_amd64.whl'
 )
 
-TORCH_PACKAGES = [
-    'torch==2.7.0',
-    'torchvision==0.22.0',
-    'torchaudio==2.7.0',
-]
-SPCONV_PACKAGE = 'spconv-cu120'
-TORCH_SCATTER = 'torch_scatter==2.1.2+pt27cu128'
-TORCH_CLUSTER = 'torch_cluster==1.6.3+pt27cu128'
-NUMPY_PIN = 'numpy==1.26.4'
+TORCH_PACKAGES = ['torch==2.7.0', 'torchvision==0.22.0', 'torchaudio==2.7.0']
+RUNTIME_PACKAGES = ['spconv-cu120', 'numpy==1.26.4', 'bpy==4.2', 'open3d', 'fast-simplification']
+PYG_PACKAGES = ['torch_scatter==2.1.2+pt27cu128', 'torch_cluster==1.6.3+pt27cu128']
 
 DIRECT_INPUT_SUFFIXES = {'.obj', '.fbx', '.glb', '.vrm'}
 CONVERTIBLE_INPUT_SUFFIXES = {'.gltf', '.stl', '.ply'}
@@ -74,10 +61,17 @@ REQUIRED_IMPORTS: list[str] = [
 @dataclass(frozen=True)
 class RuntimeContext:
     runtime_root: Path
-    repo_dir: Path
     venv_dir: Path
     python_exe: Path
     logs_dir: Path
+    extension_root: Path
+    vendor_dir: Path
+    unirig_dir: Path
+
+
+def _report(progress_cb: Optional[Callable[[int, str], None]], pct: int, message: str) -> None:
+    if progress_cb:
+        progress_cb(int(pct), message)
 
 
 class UniRigWorkspaceTool(BaseWorkspaceTool):
@@ -95,7 +89,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         state = _load_state(runtime)
         if state.get('install_state') == 'ready' and not _runtime_ready(runtime):
             state['install_state'] = 'error'
-            state['last_error'] = 'runtime files missing'
+            state['last_error'] = 'runtime files missing or vendor incomplete'
             _save_state(runtime, state)
         return state
 
@@ -109,51 +103,41 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
 
         try:
             _ensure_windows_binary_path()
-            _report(progress_cb, 5, 'preparing runtime')
-            _update_state(runtime, state, 5, 'prepare runtime')
-
-            _prepare_repo(runtime)
-            _report(progress_cb, 15, 'repo ready')
-            _update_state(runtime, state, 15, 'repo ready')
+            _setup_vendor(runtime)
+            _report(progress_cb, 10, 'vendor ready')
+            _update_state(runtime, state, 10, 'vendor ready')
 
             _create_venv(runtime)
             _report(progress_cb, 25, 'venv ready')
             _update_state(runtime, state, 25, 'venv ready')
 
             pip = [str(runtime.python_exe), '-m', 'pip']
-            _run(pip + ['install', '--upgrade', 'pip', 'setuptools', 'wheel'], cwd=runtime.repo_dir)
+            _run(pip + ['install', '--upgrade', 'pip', 'setuptools', 'wheel'])
 
-            _report(progress_cb, 35, 'installing torch cu128')
-            _run(pip + ['install', '--index-url', TORCH_INDEX_URL, *TORCH_PACKAGES], cwd=runtime.repo_dir)
-            _update_state(runtime, state, 35, 'torch installed')
+            _report(progress_cb, 40, 'installing torch cu128')
+            _run(pip + ['install', '--index-url', TORCH_INDEX_URL, *TORCH_PACKAGES])
+            _update_state(runtime, state, 40, 'torch installed')
 
-            _report(progress_cb, 50, 'installing unirig requirements (except flash_attn)')
-            _install_requirements_excluding_flash_attn(runtime)
-            _update_state(runtime, state, 50, 'requirements installed')
-
-            _report(progress_cb, 60, 'installing spconv')
-            _run(pip + ['install', SPCONV_PACKAGE], cwd=runtime.repo_dir)
-            _update_state(runtime, state, 60, 'spconv installed')
+            _report(progress_cb, 58, 'installing runtime wheels')
+            _run(pip + ['install', *RUNTIME_PACKAGES])
+            _update_state(runtime, state, 58, 'runtime wheels installed')
 
             _report(progress_cb, 70, 'installing torch_scatter/torch_cluster')
-            _run(pip + ['install', '-f', PYG_INDEX_URL, TORCH_SCATTER, TORCH_CLUSTER], cwd=runtime.repo_dir)
+            _run(pip + ['install', '-f', PYG_INDEX_URL, *PYG_PACKAGES])
             _update_state(runtime, state, 70, 'pyg deps installed')
 
-            _report(progress_cb, 78, 'installing numpy pin')
-            _run(pip + ['install', NUMPY_PIN], cwd=runtime.repo_dir)
-            _update_state(runtime, state, 78, 'numpy pinned')
-
-            _report(progress_cb, 86, 'installing flash-attn wheel')
+            _report(progress_cb, 82, 'installing flash-attn wheel')
             _install_flash_attn(runtime)
-            _update_state(runtime, state, 86, 'flash-attn installed')
+            _update_state(runtime, state, 82, 'flash-attn installed')
 
-            _report(progress_cb, 93, 'validating imports')
-            missing = _missing_imports(runtime)
+            py_path = _vendor_pythonpath(runtime)
+            _report(progress_cb, 90, 'validating imports')
+            missing = _missing_imports(runtime, py_path)
             if missing:
                 raise WorkspaceToolError(f'missing imports: {", ".join(missing)}')
 
-            _report(progress_cb, 97, 'validating run.py --help')
-            _run([str(runtime.python_exe), 'run.py', '--help'], cwd=runtime.repo_dir)
+            _report(progress_cb, 96, 'validating run.py --help')
+            _run([str(runtime.python_exe), 'run.py', '--help'], cwd=runtime.unirig_dir, extra_env={'PYTHONPATH': py_path})
 
             state.update(
                 {
@@ -194,6 +178,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         progress_cb: Optional[Callable[[int, str], None]] = None,
     ) -> Path:
         runtime = self._runtime or _resolve_runtime_context()
+        _setup_vendor(runtime)
         status = self.runtime_status()
         if status.get('install_state') != 'ready' or not _runtime_ready(runtime):
             raise WorkspaceToolError('UniRig runtime is not ready. Install runtime first.')
@@ -206,6 +191,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         output_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
         output_path = output_dir / f'{input_path.stem}_unirig_{ts}.glb'
+        py_path = _vendor_pythonpath(runtime)
 
         with tempfile.TemporaryDirectory(prefix='unirig_stage_') as tmp:
             stage_root = Path(tmp)
@@ -215,7 +201,7 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             skeleton_npz_dir = stage_root / 'skeleton_npz'
             skin_npz_dir = stage_root / 'skin_npz'
 
-            self._report(progress_cb, 50, 'Predicting skeleton…')
+            _report(progress_cb, 50, 'predicting skeleton')
             _run(
                 [
                     str(runtime.python_exe),
@@ -226,12 +212,13 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                     f'--output={skeleton_output}',
                     f'--npz_dir={skeleton_npz_dir}',
                 ],
-                cwd=runtime.repo_dir,
+                cwd=runtime.unirig_dir,
+                extra_env={'PYTHONPATH': py_path},
             )
             if not skeleton_output.exists():
                 raise WorkspaceToolError('Skeleton stage did not produce output.')
 
-            self._report(progress_cb, 72, 'Predicting skin…')
+            _report(progress_cb, 72, 'predicting skin')
             _run(
                 [
                     str(runtime.python_exe),
@@ -243,12 +230,13 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                     f'--npz_dir={skin_npz_dir}',
                     f'--data_name={SKIN_DATA_NAME}',
                 ],
-                cwd=runtime.repo_dir,
+                cwd=runtime.unirig_dir,
+                extra_env={'PYTHONPATH': py_path},
             )
             if not skin_output.exists():
                 raise WorkspaceToolError('Skin stage did not produce output.')
 
-            self._report(progress_cb, 90, 'Merging rig…')
+            _report(progress_cb, 90, 'merging rig')
             _run(
                 [
                     str(runtime.python_exe),
@@ -261,12 +249,13 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                     f'--target={prepared}',
                     f'--output={output_path}',
                 ],
-                cwd=runtime.repo_dir,
+                cwd=runtime.unirig_dir,
+                extra_env={'PYTHONPATH': py_path},
             )
 
         if not output_path.exists():
             raise WorkspaceToolError('Merge stage did not produce output GLB.')
-        self._report(progress_cb, 100, 'done')
+        _report(progress_cb, 100, 'done')
         return output_path
 
 
@@ -284,7 +273,8 @@ def _default_state(runtime: RuntimeContext) -> dict:
         'last_error': '',
         'updated_at': now,
         'runtime_root': str(runtime.runtime_root),
-        'repo_dir': str(runtime.repo_dir),
+        'vendor_dir': str(runtime.vendor_dir),
+        'unirig_dir': str(runtime.unirig_dir),
         'venv_dir': str(runtime.venv_dir),
         'python_exe': str(runtime.python_exe),
     }
@@ -314,6 +304,10 @@ def _update_state(runtime: RuntimeContext, state: dict, percent: int, step: str)
 
 
 def _resolve_runtime_context() -> RuntimeContext:
+    extension_root = Path(__file__).resolve().parent
+    vendor_dir = extension_root / 'vendor'
+    unirig_dir = vendor_dir / 'unirig'
+
     override = os.environ.get('MODLY_UNIRIG_RUNTIME_DIR')
     if override:
         runtime_root = Path(override).expanduser().resolve()
@@ -323,11 +317,54 @@ def _resolve_runtime_context() -> RuntimeContext:
             runtime_root = Path(user_data).expanduser().resolve() / 'dependencies' / TOOL_ID
         else:
             runtime_root = Path.home() / '.cache' / 'modly' / TOOL_ID
-    repo_dir = runtime_root / 'repo'
     venv_dir = runtime_root / 'venv'
     python_exe = venv_dir / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     logs_dir = runtime_root / 'logs'
-    return RuntimeContext(runtime_root=runtime_root, repo_dir=repo_dir, venv_dir=venv_dir, python_exe=python_exe, logs_dir=logs_dir)
+    return RuntimeContext(
+        runtime_root=runtime_root,
+        venv_dir=venv_dir,
+        python_exe=python_exe,
+        logs_dir=logs_dir,
+        extension_root=extension_root,
+        vendor_dir=vendor_dir,
+        unirig_dir=unirig_dir,
+    )
+
+
+def _setup_vendor(runtime: RuntimeContext) -> None:
+    if not runtime.vendor_dir.exists():
+        raise WorkspaceToolError('vendor/ is missing. Maintainer must run build_vendor.py and commit vendor/.')
+    required_paths = [
+        runtime.unirig_dir / 'run.py',
+        runtime.unirig_dir / 'src',
+        runtime.unirig_dir / 'configs',
+    ]
+    missing = [str(p) for p in required_paths if not p.exists()]
+    if missing:
+        raise WorkspaceToolError(
+            'vendor/ is incomplete. Maintainer must run build_vendor.py and commit vendor/. Missing: '
+            + ', '.join(missing)
+        )
+    vendor_str = str(runtime.vendor_dir)
+    unirig_str = str(runtime.unirig_dir)
+    if vendor_str not in sys_path_list():
+        sys_path_list().insert(0, vendor_str)
+    if unirig_str not in sys_path_list():
+        sys_path_list().insert(0, unirig_str)
+
+
+def sys_path_list() -> list[str]:
+    import sys
+
+    return sys.path
+
+
+def _vendor_pythonpath(runtime: RuntimeContext) -> str:
+    current = os.environ.get('PYTHONPATH', '').strip()
+    parts = [str(runtime.vendor_dir), str(runtime.unirig_dir)]
+    if current:
+        parts.append(current)
+    return os.pathsep.join(parts)
 
 
 def _ensure_windows_binary_path() -> None:
@@ -337,67 +374,18 @@ def _ensure_windows_binary_path() -> None:
 
 def _runtime_ready(runtime: RuntimeContext) -> bool:
     state = _load_state(runtime)
-    return state.get('install_state') == 'ready' and runtime.python_exe.exists() and (runtime.repo_dir / 'run.py').exists()
-
-
-def _prepare_repo(runtime: RuntimeContext) -> None:
-    zip_url = os.environ.get('MODLY_UNIRIG_ZIP_URL', OFFICIAL_UNIRIG_ZIP_URL)
-    cache_dir = runtime.runtime_root / 'cache'
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    if runtime.repo_dir.exists():
-        shutil.rmtree(runtime.repo_dir, ignore_errors=True)
-
-    zip_name = f'unirig-{OFFICIAL_UNIRIG_REF}.zip'
-    zip_path = cache_dir / zip_name
-    if not zip_path.exists():
-        urllib.request.urlretrieve(zip_url, str(zip_path))
-
-    unpack_root = runtime.runtime_root / 'repo_unpack'
-    if unpack_root.exists():
-        shutil.rmtree(unpack_root, ignore_errors=True)
-    shutil.unpack_archive(str(zip_path), str(unpack_root))
-
-    candidates = [p for p in unpack_root.iterdir() if p.is_dir()]
-    if not candidates:
-        raise WorkspaceToolError('Downloaded UniRig zip did not contain a repository directory')
-    extracted_repo = candidates[0]
-    shutil.move(str(extracted_repo), str(runtime.repo_dir))
-    shutil.rmtree(unpack_root, ignore_errors=True)
+    return state.get('install_state') == 'ready' and runtime.python_exe.exists() and (runtime.unirig_dir / 'run.py').exists()
 
 
 def _resolve_python311_cmd() -> list[str]:
     env_bin = os.environ.get('MODLY_UNIRIG_PYTHON311_BIN', '').strip()
     if env_bin:
         return [env_bin]
-
-    bundled_env = [
-        'MODLY_BUNDLED_PYTHON311_BIN',
-        'MODLY_EMBEDDED_PYTHON311_BIN',
-    ]
-    for key in bundled_env:
-        value = os.environ.get(key, '').strip()
-        if value:
-            return [value]
-
-    bundled_candidates = []
-    if os.name == 'nt':
-        bundled_candidates.extend([
-            Path(os.environ.get('MODLY_APP_DIR', '')) / 'python' / 'python.exe',
-            Path(os.environ.get('MODLY_HOME', '')) / 'python' / 'python.exe',
-        ])
-    for candidate in bundled_candidates:
-        if str(candidate) and candidate.exists():
-            return [str(candidate)]
-
     if shutil.which('py'):
         return ['py', '-3.11']
     if shutil.which('python3.11'):
         return ['python3.11']
-
-    raise WorkspaceToolError(
-        'Python 3.11 not found. Set MODLY_UNIRIG_PYTHON311_BIN or install Python 3.11.'
-    )
+    raise WorkspaceToolError('Python 3.11 not found. Set MODLY_UNIRIG_PYTHON311_BIN or install Python 3.11.')
 
 
 def _create_venv(runtime: RuntimeContext) -> None:
@@ -405,25 +393,6 @@ def _create_venv(runtime: RuntimeContext) -> None:
         return
     py311_cmd = _resolve_python311_cmd()
     _run([*py311_cmd, '-m', 'venv', str(runtime.venv_dir)], cwd=runtime.runtime_root)
-
-
-def _install_requirements_excluding_flash_attn(runtime: RuntimeContext) -> None:
-    req_path = runtime.repo_dir / 'requirements.txt'
-    if not req_path.exists():
-        raise WorkspaceToolError('UniRig requirements.txt not found')
-    raw_lines = req_path.read_text(encoding='utf-8', errors='replace').splitlines()
-    filtered: list[str] = []
-    for line in raw_lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        head = stripped.split(';', 1)[0].strip().split()[0].lower()
-        if head.startswith('flash_attn') or head.startswith('flash-attn'):
-            continue
-        filtered.append(stripped)
-    if not filtered:
-        return
-    _run([str(runtime.python_exe), '-m', 'pip', 'install', *filtered], cwd=runtime.repo_dir)
 
 
 def _install_flash_attn(runtime: RuntimeContext) -> None:
@@ -435,7 +404,7 @@ def _install_flash_attn(runtime: RuntimeContext) -> None:
     try:
         if not wheel_path.exists():
             urllib.request.urlretrieve(wheel_url, str(wheel_path))
-        _run([str(runtime.python_exe), '-m', 'pip', 'install', str(wheel_path)], cwd=runtime.repo_dir)
+        _run([str(runtime.python_exe), '-m', 'pip', 'install', str(wheel_path)])
     except Exception as exc:
         _append_flash_log(runtime, f'wheel_url={wheel_url}\nerror={exc}')
         raise WorkspaceToolError('flash-attn wheel install failed') from exc
@@ -448,7 +417,7 @@ def _append_flash_log(runtime: RuntimeContext, detail: str) -> None:
         handle.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}] {detail}\n')
 
 
-def _missing_imports(runtime: RuntimeContext) -> list[str]:
+def _missing_imports(runtime: RuntimeContext, py_path: str) -> list[str]:
     code = (
         'import importlib, json\n'
         f'mods={REQUIRED_IMPORTS!r}\n'
@@ -460,7 +429,7 @@ def _missing_imports(runtime: RuntimeContext) -> list[str]:
         '    missing.append(m)\n'
         'print(json.dumps({"missing":missing}))\n'
     )
-    output = _run_capture([str(runtime.python_exe), '-c', code], cwd=runtime.repo_dir)
+    output = _run_capture([str(runtime.python_exe), '-c', code], extra_env={'PYTHONPATH': py_path})
     payload = json.loads(output.strip().splitlines()[-1])
     return payload.get('missing', [])
 
@@ -471,6 +440,9 @@ def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
         return input_path.resolve()
     if suffix not in CONVERTIBLE_INPUT_SUFFIXES:
         raise WorkspaceToolError(f'Unsupported input format: {suffix}')
+
+    import trimesh
+
     converted_path = temp_root / f'{input_path.stem}_prepared.glb'
     loaded = trimesh.load(input_path, force='scene' if suffix == '.gltf' else None)
     scene = loaded.scene() if isinstance(loaded, trimesh.Trimesh) else loaded
@@ -479,15 +451,21 @@ def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
     return converted_path
 
 
-def _run(command: list[str], cwd: Path) -> None:
-    result = subprocess.run(command, cwd=str(cwd), capture_output=True, text=True)
+def _run(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout or '').strip().splitlines()[-40:]
         raise WorkspaceToolError(f'Command failed: {" ".join(command)}\n' + '\n'.join(tail))
 
 
-def _run_capture(command: list[str], cwd: Path) -> str:
-    result = subprocess.run(command, cwd=str(cwd), capture_output=True, text=True)
+def _run_capture(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> str:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout or '').strip().splitlines()[-40:]
         raise WorkspaceToolError(f'Command failed: {" ".join(command)}\n' + '\n'.join(tail))
