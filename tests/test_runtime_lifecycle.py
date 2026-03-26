@@ -194,7 +194,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
                         'generator._read_nvcc_version',
                         return_value='12.8',
                     ):
-                        home, _bin, nvcc_path, version = generator._resolve_cuda_toolkit_paths(runtime)
+                        home, _bin, nvcc_path, version, _version_output = generator._resolve_cuda_toolkit_paths(runtime)
                     self.assertEqual(str(cuda), home)
                     self.assertEqual(str(nvcc), nvcc_path)
                     self.assertEqual('12.8', version)
@@ -212,9 +212,75 @@ class RuntimeLifecycleTests(unittest.TestCase):
                         'generator._probe_executable',
                         return_value=True,
                     ), patch('generator._read_nvcc_version', return_value='12.8'):
-                        home, _bin, nvcc_path, _version = generator._resolve_cuda_toolkit_paths(runtime)
+                        home, _bin, nvcc_path, _version, _version_output = generator._resolve_cuda_toolkit_paths(runtime)
                 self.assertEqual(str(cuda), home)
                 self.assertEqual(str(nvcc), nvcc_path)
+
+    def test_resolve_cuda_from_versioned_env_var(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cuda = Path(tmp) / 'cuda_v128'
+            nvcc = cuda / 'bin' / 'nvcc.exe'
+            nvcc.parent.mkdir(parents=True, exist_ok=True)
+            nvcc.write_text('', encoding='utf-8')
+            with tempfile.TemporaryDirectory() as rt:
+                with patch.dict(
+                    os.environ,
+                    {'MODLY_UNIRIG_RUNTIME_DIR': rt, 'CUDA_PATH_V12_8': str(cuda), 'CUDA_HOME': ''},
+                    clear=False,
+                ):
+                    runtime = generator._resolve_runtime_context()
+                    with patch('generator._probe_executable', return_value=True), patch(
+                        'generator._read_nvcc_version',
+                        return_value='12.8',
+                    ), patch('generator._read_nvcc_version_output', return_value='nvcc version output'):
+                        home, _bin, nvcc_path, version, version_output = generator._resolve_cuda_toolkit_paths(runtime)
+                self.assertEqual(str(cuda), home)
+                self.assertEqual(str(nvcc), nvcc_path)
+                self.assertEqual('12.8', version)
+                self.assertEqual('nvcc version output', version_output)
+
+    def test_resolve_cuda_prefers_modly_unirig_cuda_home_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            override_cuda = Path(tmp) / 'cuda_override'
+            fallback_cuda = Path(tmp) / 'cuda_fallback'
+            override_nvcc = override_cuda / 'bin' / 'nvcc.exe'
+            fallback_nvcc = fallback_cuda / 'bin' / 'nvcc.exe'
+            override_nvcc.parent.mkdir(parents=True, exist_ok=True)
+            fallback_nvcc.parent.mkdir(parents=True, exist_ok=True)
+            override_nvcc.write_text('', encoding='utf-8')
+            fallback_nvcc.write_text('', encoding='utf-8')
+            with tempfile.TemporaryDirectory() as rt:
+                with patch.dict(
+                    os.environ,
+                    {
+                        'MODLY_UNIRIG_RUNTIME_DIR': rt,
+                        'MODLY_UNIRIG_CUDA_HOME': str(override_cuda),
+                        'CUDA_HOME': str(fallback_cuda),
+                    },
+                    clear=False,
+                ):
+                    runtime = generator._resolve_runtime_context()
+                    with patch('generator._probe_executable', return_value=True), patch(
+                        'generator._read_nvcc_version',
+                        return_value='12.8',
+                    ), patch('generator._read_nvcc_version_output', return_value='nvcc version output'):
+                        home, _bin, nvcc_path, _version, _version_output = generator._resolve_cuda_toolkit_paths(runtime)
+                self.assertEqual(str(override_cuda), home)
+                self.assertEqual(str(override_nvcc), nvcc_path)
+
+    def test_resolve_cuda_rejects_home_without_nvcc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cuda = Path(tmp) / 'cuda_missing_nvcc'
+            (cuda / 'bin').mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory() as rt:
+                with patch.dict(os.environ, {'MODLY_UNIRIG_RUNTIME_DIR': rt, 'CUDA_HOME': str(cuda)}, clear=False):
+                    runtime = generator._resolve_runtime_context()
+                    home, bin_dir, nvcc_path, version, version_output = generator._resolve_cuda_toolkit_paths(runtime)
+                self.assertEqual('', home)
+                self.assertEqual('', bin_dir)
+                self.assertEqual('', nvcc_path)
+                self.assertEqual('', version)
+                self.assertEqual('', version_output)
 
     def test_required_imports_include_flash_attn(self) -> None:
         modules = [name for name, _stmt in generator.REQUIRED_IMPORTS]

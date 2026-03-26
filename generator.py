@@ -715,6 +715,7 @@ def _default_bootstrap_state(runtime: RuntimeContext) -> dict:
         'resolved_cuda_home': '',
         'resolved_nvcc_path': '',
         'resolved_nvcc_version': '',
+        'resolved_nvcc_version_output': '',
         'toolchain_preflight': {},
         'missing_required_modules': [],
         'runpy_smoke_ok': False,
@@ -1700,6 +1701,7 @@ def _ensure_flash_attn_windows_toolchain(runtime: RuntimeContext, state: dict | 
         state['resolved_cuda_home'] = preflight.get('resolved_cuda_home', '')
         state['resolved_nvcc_path'] = preflight.get('resolved_nvcc_path', '')
         state['resolved_nvcc_version'] = preflight.get('resolved_nvcc_version', '')
+        state['resolved_nvcc_version_output'] = preflight.get('resolved_nvcc_version_output', '')
         _write_bootstrap_state(runtime, state)
     if log_path:
         _log_bootstrap_event(log_path, 'preflighting flash-attn', 'ok', json.dumps(preflight, sort_keys=True))
@@ -1714,7 +1716,7 @@ def _ensure_flash_attn_windows_toolchain(runtime: RuntimeContext, state: dict | 
 def _preflight_flash_attn_windows_toolchain(runtime: RuntimeContext) -> dict:
     ninja_path = _resolve_ninja_executable(runtime)
     vswhere_path, vcvars_path, cl_path = _resolve_msvc_toolchain_paths()
-    cuda_home, cuda_bin, nvcc_path, nvcc_version = _resolve_cuda_toolkit_paths(runtime)
+    cuda_home, cuda_bin, nvcc_path, nvcc_version, nvcc_version_output = _resolve_cuda_toolkit_paths(runtime)
     toolchain = {
         'resolved_ninja_path': ninja_path,
         'resolved_vswhere_path': vswhere_path,
@@ -1724,6 +1726,7 @@ def _preflight_flash_attn_windows_toolchain(runtime: RuntimeContext) -> dict:
         'resolved_cuda_bin': cuda_bin,
         'resolved_nvcc_path': nvcc_path,
         'resolved_nvcc_version': nvcc_version,
+        'resolved_nvcc_version_output': nvcc_version_output,
     }
     if not ninja_path:
         toolchain['ok'] = False
@@ -1741,9 +1744,13 @@ def _preflight_flash_attn_windows_toolchain(runtime: RuntimeContext) -> dict:
         return toolchain
     if not cuda_home or not nvcc_path:
         toolchain['ok'] = False
-        toolchain['error'] = (
+        preferred = _preferred_cuda_versions_from_profile(runtime)
+        required = preferred[0] if preferred else '12.8'
+        toolchain['error'] = f'CUDA Toolkit {required} not found'
+        toolchain['error_detail'] = (
             'flash-attn requires CUDA toolkit '
-            '(nvcc.exe not found in CUDA_HOME/CUDA_PATH/standard toolkit locations)'
+            '(nvcc.exe not found in MODLY_UNIRIG_CUDA_HOME/externalCudaToolkitPath/CUDA_HOME/'
+            'CUDA_PATH/CUDA_PATH_V*/standard toolkit locations)'
         )
         return toolchain
     toolchain['ok'] = True
@@ -1853,9 +1860,10 @@ def _resolve_cl_for_vcvars(vcvars_path: str) -> str:
     return ''
 
 
-def _resolve_cuda_toolkit_paths(runtime: RuntimeContext) -> tuple[str, str, str, str]:
+def _resolve_cuda_toolkit_paths(runtime: RuntimeContext) -> tuple[str, str, str, str, str]:
     preferred = _preferred_cuda_versions_from_profile(runtime)
-    env_candidates = [os.environ.get('CUDA_HOME', '').strip(), os.environ.get('CUDA_PATH', '').strip()]
+    settings = _read_modly_settings()
+    env_candidates = _cuda_home_env_candidates(settings=settings)
     for value in env_candidates:
         if not value:
             continue
@@ -1866,7 +1874,7 @@ def _resolve_cuda_toolkit_paths(runtime: RuntimeContext) -> tuple[str, str, str,
         resolved = _validate_cuda_home(cuda_home)
         if resolved:
             return resolved
-    return '', '', '', ''
+    return '', '', '', '', ''
 
 
 def _preferred_cuda_versions_from_profile(runtime: RuntimeContext) -> list[str]:
@@ -1897,7 +1905,22 @@ def _iter_standard_cuda_homes(preferred_versions: Sequence[str]) -> list[Path]:
     return [item[2] for item in scored]
 
 
-def _validate_cuda_home(cuda_home: Path) -> tuple[str, str, str, str] | None:
+def _cuda_home_env_candidates(settings: dict | None = None) -> list[str]:
+    if settings is None:
+        settings = _read_modly_settings()
+    candidates = [
+        os.environ.get('MODLY_UNIRIG_CUDA_HOME', '').strip(),
+        str(settings.get('externalCudaToolkitPath', '')).strip(),
+        os.environ.get('CUDA_HOME', '').strip(),
+        os.environ.get('CUDA_PATH', '').strip(),
+    ]
+    versioned_env_names = sorted((name for name in os.environ if name.startswith('CUDA_PATH_V')), reverse=True)
+    for name in versioned_env_names:
+        candidates.append(os.environ.get(name, '').strip())
+    return candidates
+
+
+def _validate_cuda_home(cuda_home: Path) -> tuple[str, str, str, str, str] | None:
     bin_dir = cuda_home / 'bin'
     nvcc_path = bin_dir / 'nvcc.exe'
     if not nvcc_path.exists():
@@ -1905,20 +1928,25 @@ def _validate_cuda_home(cuda_home: Path) -> tuple[str, str, str, str] | None:
     if not _probe_executable([str(nvcc_path), '--version']):
         return None
     nvcc_version = _read_nvcc_version(str(nvcc_path))
-    return str(cuda_home), str(bin_dir), str(nvcc_path), nvcc_version
+    nvcc_version_output = _read_nvcc_version_output(str(nvcc_path))
+    return str(cuda_home), str(bin_dir), str(nvcc_path), nvcc_version, nvcc_version_output
 
 
 def _read_nvcc_version(nvcc_path: str) -> str:
-    try:
-        result = subprocess.run([nvcc_path, '--version'], capture_output=True, text=True, check=False)
-    except Exception:
-        return ''
-    output = (result.stdout or '') + '\n' + (result.stderr or '')
+    output = _read_nvcc_version_output(nvcc_path)
     for line in output.splitlines():
         if 'release ' in line:
             marker = line.split('release ', 1)[1].strip()
             return marker.split(',', 1)[0].strip()
     return ''
+
+
+def _read_nvcc_version_output(nvcc_path: str) -> str:
+    try:
+        result = subprocess.run([nvcc_path, '--version'], capture_output=True, text=True, check=False)
+    except Exception:
+        return ''
+    return ((result.stdout or '') + '\n' + (result.stderr or '')).strip()
 
 
 def _probe_executable(command: Sequence[str]) -> bool:
