@@ -135,4 +135,6 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == '__main__':
     args = _parse_args()
     built = rebuild_vendor(dest_override=args.dest, source_override=args.source_zip, ref_override=args.ref)
+    source = _resolve_source(args.source_zip, args.ref)
+    print(f'vendor source: {source}')
     print(f'vendor ready at: {built}')
