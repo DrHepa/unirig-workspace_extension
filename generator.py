@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from services.workspace_tools_base import BaseWorkspaceTool, WorkspaceToolError
 
 TOOL_ID = 'unirig-workspace-v1'
-BOOTSTRAP_VERSION = 12
+BOOTSTRAP_VERSION = 13
 
 TORCH_INDEX_URL = 'https://download.pytorch.org/whl/cu128'
 PYG_INDEX_URL = 'https://data.pyg.org/whl/torch-2.7.0+cu128.html'
@@ -107,7 +107,10 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
         if state.get('install_state') == 'ready' and not _runtime_ready(runtime):
             state['install_state'] = 'error'
-            state['last_error'] = 'runtime files missing or vendor incomplete'
+            state['last_error'] = 'runtime files missing or local runtime vendor incomplete'
+            state['step'] = 'failed'
+            _save_state(runtime, state)
+        else:
             _save_state(runtime, state)
         return state
 
@@ -126,8 +129,9 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
             _create_venv(runtime)
             _update_state(runtime, state, 15, 'venv ready')
 
-            _report(progress_cb, 20, 'building vendor')
-            _ensure_vendor(runtime)
+            _report(progress_cb, 20, 'preparing runtime vendor')
+            vendor_source = _prepare_runtime_vendor(runtime)
+            state['vendor_source'] = vendor_source
             _update_state(runtime, state, 30, 'vendor ready')
 
             pip = [str(runtime.python_exe), '-m', 'pip']
@@ -193,7 +197,6 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
         progress_cb: Optional[Callable[[int, str], None]] = None,
     ) -> Path:
         runtime = self._runtime or _resolve_runtime_context()
-        _ensure_vendor(runtime)
         status = self.runtime_status()
         if status.get('install_state') != 'ready' or not _runtime_ready(runtime):
             raise WorkspaceToolError('UniRig runtime is not ready. Install runtime first.')
@@ -296,6 +299,7 @@ def _default_state(runtime: RuntimeContext) -> dict:
         'unirig_dir': str(runtime.unirig_dir),
         'venv_dir': str(runtime.venv_dir),
         'python_exe': str(runtime.python_exe),
+        'vendor_source': '',
     }
 
 
@@ -311,6 +315,7 @@ def _load_state(runtime: RuntimeContext) -> dict:
 
 def _save_state(runtime: RuntimeContext, state: dict) -> None:
     runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
+    vendor_source = state.get('vendor_source') or _current_vendor_source(runtime)
     state.update(
         {
             'bootstrap_version': BOOTSTRAP_VERSION,
@@ -319,6 +324,7 @@ def _save_state(runtime: RuntimeContext, state: dict) -> None:
             'unirig_dir': str(runtime.unirig_dir),
             'venv_dir': str(runtime.venv_dir),
             'python_exe': str(runtime.python_exe),
+            'vendor_source': vendor_source,
         }
     )
     path = _state_path(runtime)
@@ -388,14 +394,53 @@ def _validate_vendor_dir(vendor_dir: Path) -> bool:
     return all(path.exists() for path in _required_vendor_paths(vendor_dir))
 
 
-def _ensure_vendor(runtime: RuntimeContext) -> None:
-    if not _validate_vendor_dir(runtime.runtime_vendor_dir) and not _validate_vendor_dir(runtime.extension_vendor_dir):
-        _build_runtime_vendor(runtime)
+def _validate_runtime_vendor(runtime: RuntimeContext) -> bool:
+    return _validate_vendor_dir(runtime.runtime_vendor_dir)
 
+
+def _current_vendor_source(runtime: RuntimeContext) -> str:
+    if _validate_runtime_vendor(runtime):
+        return 'runtime_copy'
+    if _validate_vendor_dir(runtime.extension_vendor_dir):
+        return 'extension_snapshot'
+    return ''
+
+
+def _copy_extension_vendor_to_runtime(runtime: RuntimeContext) -> None:
+    if runtime.runtime_vendor_dir.exists():
+        shutil.rmtree(runtime.runtime_vendor_dir, ignore_errors=True)
+    runtime.runtime_vendor_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(runtime.extension_vendor_dir, runtime.runtime_vendor_dir)
+
+
+def _prepare_runtime_vendor(runtime: RuntimeContext, force_rebuild: bool = False) -> str:
+    ext_valid = _validate_vendor_dir(runtime.extension_vendor_dir)
+    if ext_valid and not force_rebuild:
+        _copy_extension_vendor_to_runtime(runtime)
+        vendor_source = 'runtime_copy'
+        _append_log(
+            runtime,
+            'runtime_vendor.log',
+            f'copied from extension snapshot; runtime_root={runtime.runtime_root}; vendor_dir={runtime.runtime_vendor_dir}',
+        )
+    else:
+        _build_runtime_vendor(runtime)
+        vendor_source = 'rebuilt'
+        _append_log(
+            runtime,
+            'runtime_vendor.log',
+            f'rebuilt via build_vendor.py; runtime_root={runtime.runtime_root}; vendor_dir={runtime.runtime_vendor_dir}',
+        )
     runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
-    if not _validate_vendor_dir(runtime.active_vendor_dir):
-        required = ', '.join(str(p) for p in _required_vendor_paths(runtime.active_vendor_dir))
-        raise WorkspaceToolError(f'vendor/ is incomplete. Missing: {required}')
+    if not _validate_runtime_vendor(runtime):
+        required = ', '.join(str(p) for p in _required_vendor_paths(runtime.runtime_vendor_dir))
+        raise WorkspaceToolError(f'runtime vendor is incomplete. Missing: {required}')
+    _append_log(
+        runtime,
+        'runtime_vendor.log',
+        f'active vendor_dir={runtime.active_vendor_dir}',
+    )
+    return vendor_source
 
 
 def _build_runtime_vendor(runtime: RuntimeContext) -> None:
@@ -429,7 +474,12 @@ def _ensure_windows_binary_path() -> None:
 def _runtime_ready(runtime: RuntimeContext) -> bool:
     runtime.active_vendor_dir, runtime.unirig_dir = _resolve_active_vendor_dirs(runtime)
     state = _load_state(runtime)
-    return state.get('install_state') == 'ready' and runtime.python_exe.exists() and _validate_vendor_dir(runtime.active_vendor_dir)
+    return (
+        state.get('install_state') == 'ready'
+        and runtime.python_exe.exists()
+        and _validate_runtime_vendor(runtime)
+        and runtime.active_vendor_dir == runtime.runtime_vendor_dir
+    )
 
 
 def _python_cmd_is_311(cmd: list[str]) -> bool:
