@@ -71,6 +71,13 @@ RUNTIME_ENV_DEFAULTS: dict[str, str] = {
     'TRANSFORMERS_NO_ADVISORY_WARNINGS': '1',
     'HF_HUB_DISABLE_TELEMETRY': '1',
 }
+PROCESS_LOG_TAIL_LINES = 80
+PRIORITY_ERROR_MARKERS = (
+    'Error found when processing',
+    'ValueError:',
+    'RuntimeError:',
+    'Unexpected error:',
+)
 
 
 @dataclass
@@ -98,35 +105,74 @@ def _run_extract(
     py_path: str,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     label: str = 'extracting',
-) -> None:
+    stage_name: str = 'extract',
+    timestamp: int | None = None,
+    data_name: str = 'raw_data.npz',
+) -> Path:
     _report(progress_cb, 0, label)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _run(
-        [
-            str(runtime.python_exe),
-            '-m',
-            'src.data.extract',
-            '--config=configs/data/quick_inference.yaml',
-            '--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm',
-            '--force_override=true',
-            '--num_runs=1',
-            '--id=0',
-            f'--time={int(time.time())}',
-            '--faces_target_count=50000',
-            f'--input_dir={input_dir}',
-            f'--output_dir={output_dir}',
-        ],
+    extract_ts = timestamp if timestamp is not None else int(time.time())
+    command = [
+        str(runtime.python_exe),
+        '-m',
+        'src.data.extract',
+        '--config=configs/data/quick_inference.yaml',
+        '--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm',
+        '--force_override=true',
+        '--num_runs=1',
+        '--id=0',
+        f'--time={extract_ts}',
+        '--faces_target_count=50000',
+        f'--input_dir={input_dir}',
+        f'--output_dir={output_dir}',
+    ]
+    result = _run_result(
+        command,
         cwd=runtime.unirig_dir,
         extra_env={'PYTHONPATH': py_path},
     )
+    _write_process_logs(runtime, f'extract_{stage_name}', result)
+    extract_log = _find_unirig_extract_log(runtime, extract_ts)
+    extract_log_tail = _read_text_tail(extract_log) if extract_log else '(extract log not found)'
+    extra_context = [
+        f'UniRig extract log path: {extract_log if extract_log else "(not found)"}',
+        f'UniRig extract log tail:\n{extract_log_tail}',
+    ]
+    if result.returncode != 0:
+        _raise_command_error(
+            stage=f'extract {stage_name} failed',
+            command=command,
+            result=result,
+            extra_context='\n'.join(extra_context),
+        )
+
+    try:
+        return _ensure_npz_generated(output_dir, data_name=data_name)
+    except WorkspaceToolError as exc:
+        raise WorkspaceToolError(
+            '\n'.join(
+                [
+                    f'extract {stage_name} failed: extract completed without {data_name}',
+                    f'Inspected output directory: {output_dir}',
+                    str(exc),
+                    f'Command: {" ".join(command)}',
+                    f'Exit code: {result.returncode}',
+                    f'Prioritized stdout lines:\n{_prioritized_tail(result.stdout)}',
+                    f'Stdout tail:\n{_tail_text(result.stdout)}',
+                    f'Stderr tail:\n{_tail_text(result.stderr)}',
+                    *extra_context,
+                ]
+            )
+        ) from exc
 
 
-def _ensure_npz_generated(output_dir: Path, data_name: str = 'raw_data.npz') -> None:
+def _ensure_npz_generated(output_dir: Path, data_name: str = 'raw_data.npz') -> Path:
     matches = list(output_dir.rglob(data_name))
     if not matches:
         raise WorkspaceToolError(
             f'UniRig preprocess did not generate {data_name}. Expected under: {output_dir}'
         )
+    return matches[0]
 
 
 class UniRigWorkspaceTool(BaseWorkspaceTool):
@@ -273,26 +319,32 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                     py_path=py_path,
                     progress_cb=progress_cb,
                     label='extracting skeleton input',
+                    stage_name='skeleton',
+                    timestamp=int(time.time()),
+                    data_name='raw_data.npz',
                 )
-                _ensure_npz_generated(skeleton_npz_dir)
             except Exception as exc:
                 raise WorkspaceToolError(f'extract skeleton failed: {exc}') from exc
 
             _report(progress_cb, 58, 'predicting skeleton')
             try:
-                _run(
-                    [
-                        str(runtime.python_exe),
-                        'run.py',
-                        f'--task={SKELETON_TASK}',
-                        f'--seed={seed}',
-                        f'--input_dir={source_input_dir}',
-                        f'--output={skeleton_output}',
-                        f'--npz_dir={skeleton_npz_dir}',
-                    ],
+                skeleton_cmd = [
+                    str(runtime.python_exe),
+                    'run.py',
+                    f'--task={SKELETON_TASK}',
+                    f'--seed={seed}',
+                    f'--input_dir={source_input_dir}',
+                    f'--output={skeleton_output}',
+                    f'--npz_dir={skeleton_npz_dir}',
+                ]
+                skeleton_result = _run_result(
+                    skeleton_cmd,
                     cwd=runtime.unirig_dir,
                     extra_env={'PYTHONPATH': py_path},
                 )
+                _write_process_logs(runtime, 'skeleton', skeleton_result)
+                if skeleton_result.returncode != 0:
+                    _raise_command_error('skeleton inference failed', skeleton_cmd, skeleton_result)
             except Exception as exc:
                 raise WorkspaceToolError(f'skeleton inference failed: {exc}') from exc
             if not skeleton_output.exists():
@@ -311,27 +363,33 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
                     py_path=py_path,
                     progress_cb=progress_cb,
                     label='extracting skin input',
+                    stage_name='skin',
+                    timestamp=int(time.time()),
+                    data_name=SKIN_DATA_NAME,
                 )
-                _ensure_npz_generated(skin_npz_dir, data_name=SKIN_DATA_NAME)
             except Exception as exc:
                 raise WorkspaceToolError(f'extract skin failed: {exc}') from exc
 
             _report(progress_cb, 80, 'predicting skin')
             try:
-                _run(
-                    [
-                        str(runtime.python_exe),
-                        'run.py',
-                        f'--task={SKIN_TASK}',
-                        f'--seed={seed}',
-                        f'--input_dir={skin_input_dir}',
-                        f'--output={skin_output}',
-                        f'--npz_dir={skin_npz_dir}',
-                        f'--data_name={SKIN_DATA_NAME}',
-                    ],
+                skin_cmd = [
+                    str(runtime.python_exe),
+                    'run.py',
+                    f'--task={SKIN_TASK}',
+                    f'--seed={seed}',
+                    f'--input_dir={skin_input_dir}',
+                    f'--output={skin_output}',
+                    f'--npz_dir={skin_npz_dir}',
+                    f'--data_name={SKIN_DATA_NAME}',
+                ]
+                skin_result = _run_result(
+                    skin_cmd,
                     cwd=runtime.unirig_dir,
                     extra_env={'PYTHONPATH': py_path},
                 )
+                _write_process_logs(runtime, 'skin', skin_result)
+                if skin_result.returncode != 0:
+                    _raise_command_error('skin inference failed', skin_cmd, skin_result)
             except Exception as exc:
                 raise WorkspaceToolError(f'skin inference failed: {exc}') from exc
             if not skin_output.exists():
@@ -339,21 +397,25 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
 
             _report(progress_cb, 90, 'merging rig')
             try:
-                _run(
-                    [
-                        str(runtime.python_exe),
-                        '-m',
-                        'src.inference.merge',
-                        f'--require_suffix={MERGE_REQUIRE_SUFFIX}',
-                        '--num_runs=1',
-                        '--id=0',
-                        f'--source={skin_output}',
-                        f'--target={staged_input}',
-                        f'--output={output_path}',
-                    ],
+                merge_cmd = [
+                    str(runtime.python_exe),
+                    '-m',
+                    'src.inference.merge',
+                    f'--require_suffix={MERGE_REQUIRE_SUFFIX}',
+                    '--num_runs=1',
+                    '--id=0',
+                    f'--source={skin_output}',
+                    f'--target={staged_input}',
+                    f'--output={output_path}',
+                ]
+                merge_result = _run_result(
+                    merge_cmd,
                     cwd=runtime.unirig_dir,
                     extra_env={'PYTHONPATH': py_path},
                 )
+                _write_process_logs(runtime, 'merge', merge_result)
+                if merge_result.returncode != 0:
+                    _raise_command_error('merge failed', merge_cmd, merge_result)
             except Exception as exc:
                 raise WorkspaceToolError(f'merge failed: {exc}') from exc
 
@@ -725,20 +787,91 @@ def _compose_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def _run(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
-    env = _compose_env(extra_env)
-    result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
+    result = _run_result(command, cwd=cwd, extra_env=extra_env)
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout or '').strip().splitlines()[-60:]
-        raise WorkspaceToolError(f'Command failed: {" ".join(command)}\n' + '\n'.join(tail))
+        _raise_command_error('command failed', command, result)
 
 
 def _run_capture(command: list[str], cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> str:
-    env = _compose_env(extra_env)
-    result = subprocess.run(command, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env)
+    result = _run_result(command, cwd=cwd, extra_env=extra_env)
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout or '').strip().splitlines()[-60:]
-        raise WorkspaceToolError(f'Command failed: {" ".join(command)}\n' + '\n'.join(tail))
+        _raise_command_error('command failed', command, result)
     return result.stdout or result.stderr or ''
+
+
+def _run_result(
+    command: list[str],
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = _compose_env(extra_env)
+    return subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _tail_text(text: str | None, max_lines: int = PROCESS_LOG_TAIL_LINES) -> str:
+    content = (text or '').strip()
+    if not content:
+        return '(empty)'
+    return '\n'.join(content.splitlines()[-max_lines:])
+
+
+def _read_text_tail(path: Path | None, max_lines: int = PROCESS_LOG_TAIL_LINES) -> str:
+    if not path or not path.exists():
+        return '(not found)'
+    try:
+        return _tail_text(path.read_text(encoding='utf-8', errors='replace'), max_lines=max_lines)
+    except Exception as exc:
+        return f'(failed to read log: {exc})'
+
+
+def _prioritized_tail(text: str | None, max_lines: int = PROCESS_LOG_TAIL_LINES) -> str:
+    lines = (text or '').splitlines()
+    prioritized = [line for line in lines if any(marker in line for marker in PRIORITY_ERROR_MARKERS)]
+    if not prioritized:
+        return '(none found)'
+    return '\n'.join(prioritized[-max_lines:])
+
+
+def _find_unirig_extract_log(runtime: RuntimeContext, timestamp: int) -> Path | None:
+    log_dir = runtime.unirig_dir / 'logs' / str(timestamp)
+    if not log_dir.exists():
+        return None
+    candidates = sorted(log_dir.glob('extract_builtin_*.txt'), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        return None
+    return candidates[-1]
+
+
+def _write_process_logs(runtime: RuntimeContext, stage_name: str, result: subprocess.CompletedProcess[str]) -> None:
+    process_dir = runtime.logs_dir / 'process'
+    process_dir.mkdir(parents=True, exist_ok=True)
+    (process_dir / f'{stage_name}.stdout.log').write_text(result.stdout or '', encoding='utf-8')
+    (process_dir / f'{stage_name}.stderr.log').write_text(result.stderr or '', encoding='utf-8')
+
+
+def _raise_command_error(
+    stage: str,
+    command: list[str],
+    result: subprocess.CompletedProcess[str],
+    extra_context: str | None = None,
+) -> None:
+    parts = [
+        stage,
+        f'Command: {" ".join(command)}',
+        f'Exit code: {result.returncode}',
+        f'Prioritized stdout lines:\n{_prioritized_tail(result.stdout)}',
+        f'Stdout tail:\n{_tail_text(result.stdout)}',
+        f'Stderr tail:\n{_tail_text(result.stderr)}',
+    ]
+    if extra_context:
+        parts.append(f'Extra context:\n{extra_context}')
+    raise WorkspaceToolError('\n'.join(parts))
 
 
 __all__ = ['UniRigWorkspaceTool']
