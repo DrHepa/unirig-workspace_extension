@@ -91,6 +91,44 @@ def _report(progress_cb: Optional[Callable[[int, str], None]], pct: int, message
         progress_cb(int(pct), message)
 
 
+def _run_extract(
+    runtime: RuntimeContext,
+    input_dir: Path,
+    output_dir: Path,
+    py_path: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    label: str = 'extracting',
+) -> None:
+    _report(progress_cb, 0, label)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            str(runtime.python_exe),
+            '-m',
+            'src.data.extract',
+            '--config=configs/data/quick_inference.yaml',
+            '--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm',
+            '--force_override=true',
+            '--num_runs=1',
+            '--id=0',
+            f'--time={int(time.time())}',
+            '--faces_target_count=50000',
+            f'--input_dir={input_dir}',
+            f'--output_dir={output_dir}',
+        ],
+        cwd=runtime.unirig_dir,
+        extra_env={'PYTHONPATH': py_path},
+    )
+
+
+def _ensure_npz_generated(output_dir: Path, data_name: str = 'raw_data.npz') -> None:
+    matches = list(output_dir.rglob(data_name))
+    if not matches:
+        raise WorkspaceToolError(
+            f'UniRig preprocess did not generate {data_name}. Expected under: {output_dir}'
+        )
+
+
 class UniRigWorkspaceTool(BaseWorkspaceTool):
     TOOL_ID = TOOL_ID
     DISPLAY_NAME = 'UniRig Workspace Tool'
@@ -217,63 +255,107 @@ class UniRigWorkspaceTool(BaseWorkspaceTool):
 
         with tempfile.TemporaryDirectory(prefix='unirig_stage_') as tmp:
             stage_root = Path(tmp)
-            prepared = _prepare_input_mesh(input_path, stage_root)
-            skeleton_output = stage_root / 'skeleton_stage.fbx'
-            skin_output = stage_root / 'skin_stage.fbx'
+            source_input_dir = stage_root / 'source_input'
             skeleton_npz_dir = stage_root / 'skeleton_npz'
+            skin_input_dir = stage_root / 'skin_input'
             skin_npz_dir = stage_root / 'skin_npz'
 
-            _report(progress_cb, 50, 'predicting skeleton')
-            _run(
-                [
-                    str(runtime.python_exe),
-                    'run.py',
-                    f'--task={SKELETON_TASK}',
-                    f'--seed={seed}',
-                    f'--input={prepared}',
-                    f'--output={skeleton_output}',
-                    f'--npz_dir={skeleton_npz_dir}',
-                ],
-                cwd=runtime.unirig_dir,
-                extra_env={'PYTHONPATH': py_path},
-            )
+            staged_input = _stage_input_mesh(input_path, source_input_dir)
+            skeleton_output = stage_root / 'skeleton_stage.fbx'
+            skin_output = stage_root / 'skin_stage.fbx'
+
+            _report(progress_cb, 45, 'extracting skeleton input')
+            try:
+                _run_extract(
+                    runtime=runtime,
+                    input_dir=source_input_dir,
+                    output_dir=skeleton_npz_dir,
+                    py_path=py_path,
+                    progress_cb=progress_cb,
+                    label='extracting skeleton input',
+                )
+                _ensure_npz_generated(skeleton_npz_dir)
+            except Exception as exc:
+                raise WorkspaceToolError(f'extract skeleton failed: {exc}') from exc
+
+            _report(progress_cb, 58, 'predicting skeleton')
+            try:
+                _run(
+                    [
+                        str(runtime.python_exe),
+                        'run.py',
+                        f'--task={SKELETON_TASK}',
+                        f'--seed={seed}',
+                        f'--input_dir={source_input_dir}',
+                        f'--output={skeleton_output}',
+                        f'--npz_dir={skeleton_npz_dir}',
+                    ],
+                    cwd=runtime.unirig_dir,
+                    extra_env={'PYTHONPATH': py_path},
+                )
+            except Exception as exc:
+                raise WorkspaceToolError(f'skeleton inference failed: {exc}') from exc
             if not skeleton_output.exists():
                 raise WorkspaceToolError('Skeleton stage did not produce output.')
 
-            _report(progress_cb, 72, 'predicting skin')
-            _run(
-                [
-                    str(runtime.python_exe),
-                    'run.py',
-                    f'--task={SKIN_TASK}',
-                    f'--seed={seed}',
-                    f'--input={skeleton_output}',
-                    f'--output={skin_output}',
-                    f'--npz_dir={skin_npz_dir}',
-                    f'--data_name={SKIN_DATA_NAME}',
-                ],
-                cwd=runtime.unirig_dir,
-                extra_env={'PYTHONPATH': py_path},
-            )
+            skin_input_dir.mkdir(parents=True, exist_ok=True)
+            staged_skeleton_input = skin_input_dir / skeleton_output.name
+            shutil.copy2(skeleton_output, staged_skeleton_input)
+
+            _report(progress_cb, 70, 'extracting skin input')
+            try:
+                _run_extract(
+                    runtime=runtime,
+                    input_dir=skin_input_dir,
+                    output_dir=skin_npz_dir,
+                    py_path=py_path,
+                    progress_cb=progress_cb,
+                    label='extracting skin input',
+                )
+                _ensure_npz_generated(skin_npz_dir, data_name=SKIN_DATA_NAME)
+            except Exception as exc:
+                raise WorkspaceToolError(f'extract skin failed: {exc}') from exc
+
+            _report(progress_cb, 80, 'predicting skin')
+            try:
+                _run(
+                    [
+                        str(runtime.python_exe),
+                        'run.py',
+                        f'--task={SKIN_TASK}',
+                        f'--seed={seed}',
+                        f'--input_dir={skin_input_dir}',
+                        f'--output={skin_output}',
+                        f'--npz_dir={skin_npz_dir}',
+                        f'--data_name={SKIN_DATA_NAME}',
+                    ],
+                    cwd=runtime.unirig_dir,
+                    extra_env={'PYTHONPATH': py_path},
+                )
+            except Exception as exc:
+                raise WorkspaceToolError(f'skin inference failed: {exc}') from exc
             if not skin_output.exists():
                 raise WorkspaceToolError('Skin stage did not produce output.')
 
             _report(progress_cb, 90, 'merging rig')
-            _run(
-                [
-                    str(runtime.python_exe),
-                    '-m',
-                    'src.inference.merge',
-                    f'--require_suffix={MERGE_REQUIRE_SUFFIX}',
-                    '--num_runs=1',
-                    '--id=0',
-                    f'--source={skin_output}',
-                    f'--target={prepared}',
-                    f'--output={output_path}',
-                ],
-                cwd=runtime.unirig_dir,
-                extra_env={'PYTHONPATH': py_path},
-            )
+            try:
+                _run(
+                    [
+                        str(runtime.python_exe),
+                        '-m',
+                        'src.inference.merge',
+                        f'--require_suffix={MERGE_REQUIRE_SUFFIX}',
+                        '--num_runs=1',
+                        '--id=0',
+                        f'--source={skin_output}',
+                        f'--target={staged_input}',
+                        f'--output={output_path}',
+                    ],
+                    cwd=runtime.unirig_dir,
+                    extra_env={'PYTHONPATH': py_path},
+                )
+            except Exception as exc:
+                raise WorkspaceToolError(f'merge failed: {exc}') from exc
 
         if not output_path.exists():
             raise WorkspaceToolError('Merge stage did not produce output GLB.')
@@ -613,16 +695,19 @@ def _ensure_runtime_dependencies(runtime: RuntimeContext, py_path: str) -> list[
     return missing
 
 
-def _prepare_input_mesh(input_path: Path, temp_root: Path) -> Path:
+def _stage_input_mesh(input_path: Path, stage_input_dir: Path) -> Path:
     suffix = input_path.suffix.lower()
+    stage_input_dir.mkdir(parents=True, exist_ok=True)
     if suffix in DIRECT_INPUT_SUFFIXES:
-        return input_path.resolve()
+        staged = stage_input_dir / f'input{suffix}'
+        shutil.copy2(input_path, staged)
+        return staged
     if suffix not in CONVERTIBLE_INPUT_SUFFIXES:
         raise WorkspaceToolError(f'Unsupported input format: {suffix}')
 
     import trimesh
 
-    converted_path = temp_root / f'{input_path.stem}_prepared.glb'
+    converted_path = stage_input_dir / 'input.glb'
     loaded = trimesh.load(input_path, force='scene' if suffix == '.gltf' else None)
     scene = loaded.scene() if isinstance(loaded, trimesh.Trimesh) else loaded
     blob = scene.export(file_type='glb')
